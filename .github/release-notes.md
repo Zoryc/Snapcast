@@ -1,22 +1,18 @@
-The video list shows which video the page is playing, casting through the local proxy works on more sites, expired links say so, and a stopped cast no longer looks like it is still playing.
+Casts through the local proxy no longer stop after a few minutes with the phone's screen off.
 
 ### Install
 
-Download **`snapcast-1.1.3-arm64-v8a.apk`** (almost every phone from the last few years) and open it on your phone. Older 32-bit phones need `armeabi-v7a`; `x86_64` is for emulators and Chromebooks.
+Download **`snapcast-1.1.4-arm64-v8a.apk`** (almost every phone from the last few years) and open it on your phone. Older 32-bit phones need `armeabi-v7a`; `x86_64` is for emulators and Chromebooks.
 
-**Updating from 0.1.1:** uninstall 0.1.1 first. Like 0.1.1, this version is signed with a temporary key, so Android refuses to install it over the previous one.
+**Updating from 1.1.3:** uninstall 1.1.3 first. Like 1.1.3, this version is signed with a temporary key, so Android refuses to install it over the previous one.
 
-### What's new in 1.1.3
+### What's new in 1.1.4
 
-- **See which video the page is playing.** On streaming sites the list holds the episode, trailers, previews and ads. The video the site's player is playing (or that you paused) now comes first in the list, tagged **Playing on page** or **Paused on page**. A video with sound counts before a muted ad or preview.
-- **Casting through the local proxy works where only "no proxy" worked before:**
-  - playlists that start with an invisible byte order mark, use old Mac line breaks, or come compressed (gzip, deflate) are read correctly;
-  - playlists that a server labels as video, and encryption keys that it labels as playlists, are recognised from their content;
-  - playlists that build their links from variables (`EXT-X-DEFINE`, for example a token copied from the playlist's own link) now reach the right files;
-  - when the phone can't connect to a video's server at all (a certificate it can't check, a blocked address), Snapcast casts the video directly instead, the way it plays with **Use local proxy** turned off.
-- **Expired links are explained.** Many sites answer an expired link with a web page instead of the video. The phone player and the Chromecast used to show "malformed manifest" or a generic error. They now say the link has probably expired, and the player offers **Reload page**.
-- **Stopping a cast clears it.** After **Stop**, the mini controller and the cast screen no longer show the stopped video with a Play button that did nothing.
-- **Better video detection.** A DASH stream that a server labels as HLS (or the reverse) gets the right type, so it no longer fails to play on the phone. Streams with no file extension in their link now get their qualities listed.
+- **Proxied casts keep playing with the screen off.** With **Use local proxy**, the phone serves the video to the Chromecast for the whole film. With the screen off, Android can lose sight of the Chromecast or drop its connection to it for a moment; Snapcast took that as the end of the cast and shut the proxy down while the Chromecast was still playing from it, so the cast stopped once its buffer ran out (casts without the proxy were not affected). The proxy now stays up as long as the Chromecast uses it, and the phone keeps its Wi-Fi and processor awake while it plays, even after hours.
+- **Pausing from the TV.** If you pause with the TV's remote while the phone is out of touch, the proxy waits half an hour for you to resume, and Snapcast gets back to full speed as soon as the Chromecast starts fetching again.
+- **A stream that fails restarts itself.** If the Chromecast gives up on a proxied stream (a Wi-Fi hiccup, a server that hung for a moment), Snapcast loads it again where it stopped, up to three times in ten minutes, before showing the error. An expired link is still reported straight away.
+- **Stop from anywhere.** **Stop casting** in the Cast dialog or Android's media output panel now ends the cast and the proxy at once, like Snapcast's own **Stop**.
+- The proxy gets the same address back after a restart, and a proxy port changed in the settings while casting is used for the next cast.
 
 ### Known limitations
 

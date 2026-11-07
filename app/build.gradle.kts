@@ -19,8 +19,8 @@ android {
         applicationId = "app.snapcast"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 3
-        versionName = "1.1.3"
+        versionCode = 4
+        versionName = "1.1.4"
     }
 
     // Release signing comes from the SNAPCAST_KEYSTORE_* environment variables (set in CI from repository
