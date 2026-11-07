@@ -29,10 +29,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
@@ -46,8 +43,10 @@ import kotlin.math.abs
  * remote volume) mirrored from [CastTarget.playback].
  *
  * Started by the cast controller right before it sends a load (while the app is still in the foreground);
- * stops itself when the session ends or nothing has been loaded for [ServiceStopPolicy.GRACE_MS]. Works
- * without the notification permission (the service still runs; the notification is just not shown).
+ * stops itself when the session is ended, when nothing has been loaded for [ServiceStopPolicy.GRACE_MS], or,
+ * when the session was lost, once no receiver has used the proxy for [ServiceStopPolicy.RECEIVER_IDLE_MS]
+ * (timing in [CastServiceKeeper]). Works without the notification permission (the service still runs; the
+ * notification is just not shown).
  */
 @AndroidEntryPoint
 class CastPlaybackService : Service() {
@@ -66,6 +65,7 @@ class CastPlaybackService : Service() {
     private lateinit var mediaSession: MediaSessionCompat
     private lateinit var volumeProvider: RemoteVolumeProvider
     private lateinit var locks: CastLocks
+    private lateinit var keeper: CastServiceKeeper
     private lateinit var artwork: ArtworkLoader
 
     private var holdsProxy = false
@@ -104,6 +104,18 @@ class CastPlaybackService : Service() {
         proxyManager.acquire()
         holdsProxy = true
         locks.acquire()
+        keeper = CastServiceKeeper(
+            scope = scope,
+            connectionState = target.connectionState,
+            playerState = target.playback.map { it?.playerState },
+            endedOnPurpose = target.sessionEndedOnPurpose,
+            receiverIdleMillis = proxyManager::receiverIdleMillis,
+            locks = locks,
+            onStop = { reason ->
+                Log.i(TAG, "Stopping: $reason")
+                shutdown()
+            },
+        )
         observe()
         observeLockPolicy()
     }
@@ -148,65 +160,11 @@ class CastPlaybackService : Service() {
         }
     }
 
-    /** Holds the Wi-Fi and wake locks while the receiver plays; releases them a while after it pauses or stops. */
     private fun observeLockPolicy() {
-        scope.launch {
-            target.playback
-                .map { WakeLockPolicy.decide(it?.playerState) }
-                .distinctUntilChanged()
-                .collectLatest { decision ->
-                    when (decision) {
-                        WakeLockPolicy.Decision.HOLD -> locks.acquire()
-                        WakeLockPolicy.Decision.RELEASE_AFTER_DELAY -> {
-                            delay(WakeLockPolicy.RELEASE_DELAY_MS)
-                            locks.release()
-                        }
-                        WakeLockPolicy.Decision.RELEASE_WHEN_RECEIVER_IDLE -> {
-                            delay(WakeLockPolicy.RELEASE_DELAY_MS)
-                            awaitReceiverIdle()
-                            locks.release()
-                        }
-                    }
-                }
-        }
+        keeper.observeLocks()
     }
 
-    private fun observeStopPolicy(): Job = scope.launch {
-        combine(
-            target.connectionState,
-            target.playback.map { it != null && it.playerState != RemotePlayerState.IDLE }.distinctUntilChanged(),
-            target.sessionEndedOnPurpose,
-        ) { state, loaded, endedOnPurpose -> ServiceStopPolicy.decide(state, loaded, endedOnPurpose) }
-            .distinctUntilChanged()
-            .collectLatest { decision ->
-                when (decision) {
-                    ServiceStopPolicy.Decision.KEEP -> Unit
-                    ServiceStopPolicy.Decision.STOP_NOW -> shutdown()
-                    ServiceStopPolicy.Decision.STOP_AFTER_GRACE -> {
-                        delay(ServiceStopPolicy.GRACE_MS)
-                        shutdown()
-                    }
-                    ServiceStopPolicy.Decision.STOP_WHEN_RECEIVER_IDLE -> {
-                        delay(ServiceStopPolicy.GRACE_MS)
-                        awaitReceiverIdle()
-                        Log.i(TAG, "No session and no receiver using the proxy: stopping")
-                        shutdown()
-                    }
-                }
-            }
-    }
-
-    /**
-     * Returns once no receiver has used the proxy for [ServiceStopPolicy.RECEIVER_IDLE_MS] (at once if none ever
-     * did). A receiver that lost its session with the phone goes on playing from the proxy, which must stay up.
-     */
-    private suspend fun awaitReceiverIdle() {
-        while (true) {
-            val idle = proxyManager.receiverIdleMillis() ?: return
-            if (idle >= ServiceStopPolicy.RECEIVER_IDLE_MS) return
-            delay(ServiceStopPolicy.RECEIVER_IDLE_MS - idle)
-        }
-    }
+    private fun observeStopPolicy(): Job = keeper.observeStop()
 
     // region Rendering
 

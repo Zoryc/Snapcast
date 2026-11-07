@@ -10,7 +10,7 @@ import android.os.SystemClock
  * Wi-Fi and CPU locks held while the receiver plays, so the proxy keeps serving it with the screen off
  * ([WakeLockPolicy] decides when). Not reference counted; safe to acquire and release repeatedly.
  */
-internal class CastLocks(context: Context) {
+internal class CastLocks(context: Context) : ServiceLocks {
     private val wifiLock: WifiManager.WifiLock? = runCatching {
         context.applicationContext.getSystemService(WifiManager::class.java)
             ?.createWifiLock(wifiLockMode(), LOCK_TAG)
@@ -25,7 +25,7 @@ internal class CastLocks(context: Context) {
 
     private var wakeLockAcquiredAt = 0L
 
-    fun acquire() {
+    override fun acquire() {
         runCatching { wifiLock?.takeUnless { it.isHeld }?.acquire() }
         acquireWakeLock()
     }
@@ -48,7 +48,7 @@ internal class CastLocks(context: Context) {
         }
     }
 
-    fun release() {
+    override fun release() {
         runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
     }
