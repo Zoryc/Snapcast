@@ -30,9 +30,8 @@ through a small proxy on the phone that replays the browser's own request header
 User-Agent), so streams that refuse anonymous requests still play on the TV. Firefox add-ons such as
 **uBlock Origin** install straight from addons.mozilla.org.
 
-> **Vibe coded.** Snapcast's code was written by an AI coding assistant (Claude Code) following the
-> author's directions, not by hand. It is checked by unit tests, an emulator field test in CI and
-> everyday use, but it has not been reviewed line by line by a person.
+> **Vibe coded, not audited.** Snapcast's code was written by an AI coding assistant (Claude Code)
+> following the author's directions, and has not been audited. Use it at your own risk.
 
 ## Download
 
