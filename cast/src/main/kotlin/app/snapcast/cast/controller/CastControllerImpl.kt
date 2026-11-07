@@ -503,6 +503,10 @@ internal class CastControllerImpl @Inject constructor(
             if (result.isFailure) {
                 Log.w(TAG, "Load failed", result.exceptionOrNull())
                 suppressReceiverErrorsUntil = SystemClock.elapsedRealtime() + RECEIVER_ERROR_SUPPRESS_MS
+                // Its failed status may have come before this reply: the caller gets the error, not an event too.
+                chromecast.playback.value
+                    ?.takeIf { it.idleReason == IDLE_REASON_ERROR }
+                    ?.let { lastReceiverErrorKey = errorKey(it) }
                 val problem = proxyManager.takeRecentProblem(
                     PROXY_PROBLEM_WINDOW_MS,
                     batch.items.mapNotNullTo(HashSet()) { StreamProxy.streamIdOf(it.contentUrl) },
@@ -771,6 +775,9 @@ internal class CastControllerImpl @Inject constructor(
                         pendingExpiry?.cancel()
                         scope.launch(Dispatchers.Main.immediate) { runPendingRequest(request) }
                     }
+                    // A session that comes back usually brings an unchanged status, which is not emitted again:
+                    // a failure seen (or missed) while it was away is looked at now.
+                    onReceiverError(chromecast.playback.value)
                 }
                 CastConnectionState.CONNECTING -> Unit
                 CastConnectionState.NOT_CONNECTED,
@@ -867,10 +874,18 @@ internal class CastControllerImpl @Inject constructor(
     /** The receiver failed on its item: a proxied one that may play again is reloaded, otherwise the error is told. */
     private fun onReceiverError(state: RemotePlaybackState?) {
         val current = state ?: return
-        if (current.idleReason != IDLE_REASON_ERROR || loadsInFlight > 0 || recovering) return
-        if (SystemClock.elapsedRealtime() < suppressReceiverErrorsUntil) return
+        if (current.idleReason != IDLE_REASON_ERROR || loadsInFlight > 0) return
+        // Seen without a connected session (stale during a suspension, or published as a session is attached):
+        // looked at once it is connected (see observeConnection).
+        if (chromecast.connectionState.value != CastConnectionState.CONNECTED) return
         val key = errorKey(current)
-        if (key == lastReceiverErrorKey) return
+        if (SystemClock.elapsedRealtime() < suppressReceiverErrorsUntil) {
+            // The failed status of a load whose error was already given: never reported later.
+            lastReceiverErrorKey = key
+            return
+        }
+        // During a recovery the key is not noted: whatever is new is looked at once it ends.
+        if (recovering || key == lastReceiverErrorKey) return
         lastReceiverErrorKey = key
         // The failed item: the proxied one last seen playing, unless the receiver names another (a failed
         // status may not carry its media).
@@ -941,14 +956,23 @@ internal class CastControllerImpl @Inject constructor(
             if (generation != loadGeneration || loadsInFlight > 0) return
             val state = chromecast.playback.value
             val stillFailed = if (reloadFailed) {
-                // The failed reload left its own idle item, or nothing.
-                state == null || state.playerState == RemotePlayerState.IDLE
+                // The failed reload left its own idle item (a failed load may leave no reason), or nothing; not
+                // one stopped, finished or replaced since.
+                state == null || (state.playerState == RemotePlayerState.IDLE && state.idleReason !in ENDED_REASONS)
             } else {
                 state != null && state.idleReason == IDLE_REASON_ERROR && state.currentItemId == failedItemId
             }
             if (!stillFailed) return
+            val own = loadGeneration + 1
             val reloaded = reload(item) ?: break
             if (reloaded) {
+                lastReceiverErrorKey = null
+                return
+            }
+            // A newer load (a cast, an append, a subtitle) started meanwhile: it replaced ours, not ours to report.
+            if (loadGeneration != own) return
+            // The session went away while it loaded: looked at again when it comes back.
+            if (chromecast.connectionState.value != CastConnectionState.CONNECTED) {
                 lastReceiverErrorKey = null
                 return
             }
@@ -1088,6 +1112,13 @@ internal class CastControllerImpl @Inject constructor(
         const val PROXY_PROBLEM_WINDOW_MS = 30_000L
         const val IDLE_REASON_FINISHED = ReceiverQueue.IDLE_REASON_FINISHED
         const val IDLE_REASON_ERROR = ReceiverQueue.IDLE_REASON_ERROR
+
+        /** Idle reasons of media someone ended (stopped, finished, replaced), as opposed to one that failed. */
+        val ENDED_REASONS = setOf(
+            ReceiverQueue.IDLE_REASON_CANCELED,
+            ReceiverQueue.IDLE_REASON_FINISHED,
+            ReceiverQueue.IDLE_REASON_INTERRUPTED,
+        )
 
         /** android.Manifest.permission.ACCESS_LOCAL_NETWORK (Android 17, API 37). */
         const val PERMISSION_ACCESS_LOCAL_NETWORK = "android.permission.ACCESS_LOCAL_NETWORK"
