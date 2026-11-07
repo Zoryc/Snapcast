@@ -1,6 +1,7 @@
 package app.snapcast.cast.controller
 
 import app.snapcast.cast.CastConnectionState
+import app.snapcast.cast.CastQueueItem
 import app.snapcast.cast.RemotePlaybackState
 import app.snapcast.cast.RemotePlayerState
 import app.snapcast.proxy.StreamProblem
@@ -23,12 +24,14 @@ class ReceiverRecoveryTest {
         player: RemotePlayerState = RemotePlayerState.IDLE,
         idleReason: String? = ERROR,
         contentUrl: String? = FILM,
+        queue: List<Int> = emptyList(),
     ) =
         RemotePlaybackState(
             title = "Film", subtitle = null, posterUrl = null, playerState = player, positionMs = 600_000L,
             durationMs = 6_000_000L, isLive = false, isSeekable = true, volume = 1.0, isMuted = false,
             playbackRate = 1.0, supportsPlaybackRate = true, textTracks = emptyList(), activeTextTrackId = null,
-            queue = emptyList(), currentItemId = itemId,
+            queue = queue.map { CastQueueItem(it, "Item $it", subtitle = null, posterUrl = null, originalUrl = null) },
+            currentItemId = itemId,
             idleReason = if (player == RemotePlayerState.IDLE) idleReason else null,
             originalUrl = "https://cdn.test/film.m3u8", contentUrl = contentUrl,
         )
@@ -229,6 +232,30 @@ class ReceiverRecoveryTest {
         receiver.playback = state(itemId = 101, idleReason = ReceiverQueue.IDLE_REASON_CANCELED)
         assertThat(second.await()).isEqualTo(ReceiverRecovery.Outcome.Replaced)
         assertThat(receiver.reloadsAt).hasSize(1)
+    }
+
+    @Test
+    fun `after a failed reload, a skip to a queued item that fails without media is not reloaded over`() = runTest {
+        val (recovery, receiver) = setUp()
+        receiver.playback = state(itemId = 1, queue = listOf(1, 2))
+        receiver.results.addLast(false)
+        receiver.afterFailedReload = { id -> state(itemId = id, contentUrl = null, queue = listOf(1, id, 2)) }
+        val result = async { recovery.recover(receiver, 1, FILM, null) }
+        advanceTimeBy(3_000L)
+        // Next pressed: item 2 fails too, its status without media.
+        receiver.playback = state(itemId = 2, contentUrl = null, queue = listOf(1, 101, 2))
+        assertThat(result.await()).isEqualTo(ReceiverRecovery.Outcome.Replaced)
+        assertThat(receiver.reloadsAt).hasSize(1)
+    }
+
+    @Test
+    fun `the copy a failed reload left, without media, is reloaded again`() = runTest {
+        val (recovery, receiver) = setUp()
+        receiver.playback = state(itemId = 1, queue = listOf(1, 2))
+        receiver.results.addLast(false)
+        receiver.afterFailedReload = { id -> state(itemId = id, idleReason = null, contentUrl = null, queue = listOf(1, id, 2)) }
+        assertThat(recovery.recover(receiver, 1, FILM, null)).isEqualTo(ReceiverRecovery.Outcome.Recovered)
+        assertThat(receiver.reloadsAt).hasSize(2)
     }
 
     @Test

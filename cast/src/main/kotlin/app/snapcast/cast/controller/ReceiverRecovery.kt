@@ -81,6 +81,10 @@ internal class ReceiverRecovery(private val clock: () -> Long) {
         var generation = host.loadGeneration
         var reloadFailed = false
         val session = host.session
+        // The other items already queued: a reload's copies get new ids, so being on one of these means the
+        // receiver moved on (a skip), even when its status carries no media.
+        val others = host.playback?.queue.orEmpty()
+            .mapNotNullTo(HashSet()) { queued -> queued.itemId.takeIf { it != failedItemId } }
         while (true) {
             val used = reloadsInWindow()
             if (used >= DELAYS_MS.size) return Outcome.Failed(problem)
@@ -97,7 +101,8 @@ internal class ReceiverRecovery(private val clock: () -> Long) {
                 return if (host.loadGeneration == generation) Outcome.Lost else Outcome.Replaced
             }
             if (host.loadGeneration != generation || host.loadsInFlight > 0) return Outcome.Replaced
-            if (!stillFailed(host.playback, reloadFailed, failedItemId, failedContentUrl)) return Outcome.Replaced
+            val failed = stillFailed(host.playback, reloadFailed, failedItemId, failedContentUrl, others)
+            if (!failed) return Outcome.Replaced
             reloads.addLast(clock())
             val reloaded = host.reload() ?: return Outcome.Failed(problem)
             if (host.loadGeneration != generation + 1) return Outcome.Replaced
@@ -121,11 +126,13 @@ internal class ReceiverRecovery(private val clock: () -> Long) {
         reloadFailed: Boolean,
         failedItemId: Int?,
         failedContentUrl: String,
+        others: Set<Int>,
     ): Boolean =
         if (reloadFailed) {
             state == null || (
                 state.playerState == RemotePlayerState.IDLE && state.idleReason !in ENDED_REASONS &&
-                    (state.contentUrl == null || state.contentUrl == failedContentUrl)
+                    (state.contentUrl == null || state.contentUrl == failedContentUrl) &&
+                    (state.currentItemId == null || state.currentItemId !in others)
                 )
         } else {
             state != null && state.idleReason == ReceiverQueue.IDLE_REASON_ERROR && state.currentItemId == failedItemId
