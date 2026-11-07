@@ -23,6 +23,8 @@ internal data class CastNotificationContent(
     val isPlaying: Boolean,
     val isSeekable: Boolean,
     val artwork: Bitmap?,
+    /** False while the session is lost: only Stop can reach the receiver (by stopping the proxy). */
+    val controllable: Boolean = true,
 )
 
 /** Builds the casting notification: MediaStyle with rewind / play-pause / forward / stop actions. */
@@ -44,6 +46,10 @@ internal class CastNotificationFactory(private val service: Service) {
 
     fun build(content: CastNotificationContent, token: MediaSessionCompat.Token?): Notification {
         val actions = ArrayList<NotificationCompat.Action>()
+        if (!content.controllable) {
+            actions += action(R.drawable.ic_cast_stop, R.string.cast_action_stop, CastPlaybackService.ACTION_STOP)
+            return build(content, token, actions, intArrayOf(0))
+        }
         if (content.isSeekable) {
             actions += action(
                 R.drawable.ic_cast_replay_10,
@@ -72,6 +78,15 @@ internal class CastNotificationFactory(private val service: Service) {
         } else {
             intArrayOf(playPauseIndex, stopIndex)
         }
+        return build(content, token, actions, compactActions)
+    }
+
+    private fun build(
+        content: CastNotificationContent,
+        token: MediaSessionCompat.Token?,
+        actions: List<NotificationCompat.Action>,
+        compactActions: IntArray,
+    ): Notification {
         val style = MediaNotificationCompat.MediaStyle()
             .setMediaSession(token)
             .setShowActionsInCompactView(*compactActions)

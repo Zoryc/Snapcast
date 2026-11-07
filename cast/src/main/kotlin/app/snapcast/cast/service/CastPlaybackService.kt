@@ -8,6 +8,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.media.AudioManager
 import android.os.SystemClock
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
@@ -80,6 +81,9 @@ class CastPlaybackService : Service() {
     /** What the receiver last reported, shown while the session is lost (it may play on meanwhile). */
     private var lastKnownPlayback: RemotePlaybackState? = null
     private var lastKnownDevice: CastDeviceInfo? = null
+
+    /** The session is lost and [lastKnownPlayback] is shown: the transport controls and volume reach nothing. */
+    private var sessionLost = false
     private var lastMetadata: MetadataKey? = null
     private var lastSessionState: SessionStateKey? = null
     private var lastSessionPositionMs = 0L
@@ -94,7 +98,7 @@ class CastPlaybackService : Service() {
     )
 
     /** Session playback state apart from the position, which the system extrapolates from the speed. */
-    private data class SessionStateKey(val state: Int, val actions: Long, val speed: Float)
+    private data class SessionStateKey(val state: Int, val actions: Long, val speed: Float, val controllable: Boolean)
 
     override fun onCreate() {
         super.onCreate()
@@ -174,7 +178,18 @@ class CastPlaybackService : Service() {
                     // of a media session that stays inactive for 10 minutes).
                     if (playback != null) lastKnownPlayback = playback
                     if (device != null) lastKnownDevice = device
-                    render(playback ?: lastKnownPlayback, device ?: lastKnownDevice)
+                    val lost = playback == null && lastKnownPlayback != null
+                    if (lost != sessionLost) {
+                        sessionLost = lost
+                        // The volume keys go back to the phone meanwhile: a remote volume would move a slider
+                        // that changes nothing.
+                        if (lost) {
+                            mediaSession.setPlaybackToLocal(AudioManager.STREAM_MUSIC)
+                        } else {
+                            mediaSession.setPlaybackToRemote(volumeProvider)
+                        }
+                    }
+                    render(playback ?: lastKnownPlayback, device ?: lastKnownDevice, controllable = !lost)
                 }
         }
     }
@@ -187,37 +202,48 @@ class CastPlaybackService : Service() {
 
     // region Rendering
 
-    private fun render(playback: RemotePlaybackState?, device: CastDeviceInfo?) {
-        updatePlaybackState(playback)
+    private fun render(playback: RemotePlaybackState?, device: CastDeviceInfo?, controllable: Boolean) {
+        updatePlaybackState(playback, controllable)
         if (playback != null) {
             val steps = VolumeSteps.toSteps(playback.volume)
             if (volumeProvider.currentVolume != steps) volumeProvider.currentVolume = steps
         }
         updateMetadata(playback)
-        val content = notificationContent(playback, device)
+        val content = notificationContent(playback, device, controllable)
         if (content != lastContent) {
             lastContent = content
             postNotification(content)
         }
     }
 
-    private fun notificationContent(playback: RemotePlaybackState?, device: CastDeviceInfo?): CastNotificationContent =
+    private fun notificationContent(
+        playback: RemotePlaybackState?,
+        device: CastDeviceInfo?,
+        controllable: Boolean = true,
+    ): CastNotificationContent =
         CastNotificationContent(
             title = playback?.title?.takeIf { it.isNotBlank() } ?: getString(R.string.cast_notification_title_default),
-            text = device?.let { getString(R.string.cast_notification_casting_to, it.name) }
-                ?: getString(R.string.cast_notification_casting),
+            text = when {
+                !controllable -> device?.let { getString(R.string.cast_notification_not_connected_to, it.name) }
+                    ?: getString(R.string.cast_notification_not_connected)
+                else -> device?.let { getString(R.string.cast_notification_casting_to, it.name) }
+                    ?: getString(R.string.cast_notification_casting)
+            },
             subText = playback?.subtitle,
             isPlaying = playback?.playerState == RemotePlayerState.PLAYING ||
                 playback?.playerState == RemotePlayerState.BUFFERING,
             isSeekable = playback?.isSeekable == true,
             artwork = artwork.cached(playback?.posterUrl),
+            controllable = controllable,
         )
 
     /**
      * Mirrors the receiver state into the media session. Position-only changes are skipped while they match
      * the system's extrapolation (position + elapsed time x speed), so the session is not updated every second.
+     * While the session is lost (not [controllable]) the last state is kept, so the session stays active, with
+     * only Stop.
      */
-    private fun updatePlaybackState(playback: RemotePlaybackState?) {
+    private fun updatePlaybackState(playback: RemotePlaybackState?, controllable: Boolean) {
         val state = when (playback?.playerState) {
             RemotePlayerState.PLAYING -> PlaybackStateCompat.STATE_PLAYING
             RemotePlayerState.PAUSED -> PlaybackStateCompat.STATE_PAUSED
@@ -231,7 +257,8 @@ class CastPlaybackService : Service() {
             actions = actions or PlaybackStateCompat.ACTION_SEEK_TO or
                 PlaybackStateCompat.ACTION_FAST_FORWARD or PlaybackStateCompat.ACTION_REWIND
         }
-        if (playback != null) {
+        if (!controllable) actions = PlaybackStateCompat.ACTION_STOP
+        if (controllable && playback != null) {
             val index = playback.queue.indexOfFirst { it.itemId == playback.currentItemId }
             if (index >= 0 && index < playback.queue.lastIndex) {
                 actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_NEXT
@@ -242,7 +269,7 @@ class CastPlaybackService : Service() {
         val positionMs = playback?.positionMs ?: PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN
         val now = SystemClock.elapsedRealtime()
         // The custom actions below depend only on isSeekable and the skip bits, which are part of actions.
-        val key = SessionStateKey(state, actions, speed)
+        val key = SessionStateKey(state, actions, speed, controllable)
         val expectedMs = lastSessionPositionMs + ((now - lastSessionUpdateAt) * speed).toLong()
         if (key == lastSessionState && abs(expectedMs - positionMs) < POSITION_DRIFT_MS) return
         lastSessionState = key
@@ -256,7 +283,7 @@ class CastPlaybackService : Service() {
         // FAST_FORWARD don't). Custom actions fill the previous slot, the next slot, then two extra slots, so
         // with both previous and next present only two fit: Stop is kept. Older versions ignore them.
         val skipBoth = PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or PlaybackStateCompat.ACTION_SKIP_TO_NEXT
-        if (playback?.isSeekable == true && (actions and skipBoth) != skipBoth) {
+        if (controllable && playback?.isSeekable == true && (actions and skipBoth) != skipBoth) {
             builder.addCustomAction(ACTION_REWIND, getString(R.string.cast_action_rewind), R.drawable.ic_cast_replay_10)
             builder.addCustomAction(ACTION_FORWARD, getString(R.string.cast_action_forward), R.drawable.ic_cast_forward_10)
         }
