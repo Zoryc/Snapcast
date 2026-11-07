@@ -274,6 +274,9 @@ internal class ChromecastTarget @Inject constructor(
                 return@withContext load(listOf(media), startPositionMs = positionMs, autoplay = autoplay)
             }
             val beforeId = QueuePositions.insertBeforeId(ids, currentId) ?: MediaQueueItem.INVALID_ITEM_ID
+            val currentFailed = remote.mediaStatus?.let {
+                it.playerState == MediaStatus.PLAYER_STATE_IDLE && it.idleReason == MediaStatus.IDLE_REASON_ERROR
+            } == true
             val item = MediaInfoMapper.toQueueItem(media, startPositionMs = positionMs)
             // Without a position the receiver starts at its default: the beginning, or a live stream's live edge.
             val pending = if (positionMs > 0) {
@@ -285,6 +288,16 @@ internal class ChromecastTarget @Inject constructor(
             if (result.isSuccess) {
                 remote.queueRemoveItem(currentId, null)
                 if (!autoplay) remote.pause()
+            } else {
+                // A failed attempt leaves one copy of the item, not one more each time: a copy that never became
+                // current goes; once the receiver is on the copy, the old item goes if it had failed too.
+                val nowCurrent = currentItemId(remote)
+                val inserted = queueItemIds(remote).filter { it !in ids }
+                if (nowCurrent != null && nowCurrent != currentId) {
+                    if (currentFailed) remote.queueRemoveItem(currentId, null)
+                } else if (inserted.isNotEmpty()) {
+                    remote.queueRemoveItems(inserted.toIntArray(), null)
+                }
             }
             result
         }

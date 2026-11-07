@@ -154,7 +154,7 @@ internal class CastControllerImpl @Inject constructor(
 
     /**
      * The proxied item last seen playing (or paused), where it was and whether it played, and its media once
-     * read from the receiver: what [recover] loads again when the receiver fails on it.
+     * read from the receiver: what [reload] loads again when the receiver fails on it.
      */
     private data class ProxiedItem(
         val contentUrl: String,
@@ -294,7 +294,9 @@ internal class CastControllerImpl @Inject constructor(
     private suspend fun appendToReceiver(video: DetectedVideo, variant: VideoVariant?, playNext: Boolean): CastResult {
         // Appending to a receiver with no media loads it, replacing a load in flight.
         loadGeneration++
+        loadsInFlight++
         proxyManager.acquire()
+        var failed = true
         try {
             val media = buildRemote(video, variant, subtitle = null, direct = false)
             remember(video)
@@ -306,6 +308,7 @@ internal class CastControllerImpl @Inject constructor(
                 Log.w(TAG, "Queueing failed", result.exceptionOrNull())
                 return failure(CastErrorKind.LOAD_FAILED, R.string.cast_error_queue)
             }
+            failed = false
             _events.tryEmit(CastEvent.Queued(media.title))
             return CastResult.Success
         } catch (failure: CastFailure) {
@@ -316,7 +319,9 @@ internal class CastControllerImpl @Inject constructor(
             Log.w(TAG, "Queueing failed", e)
             return failure(CastErrorKind.LOAD_FAILED, R.string.cast_error_queue)
         } finally {
+            loadsInFlight--
             proxyManager.release()
+            afterOwnLoad(failed)
         }
     }
 
@@ -345,7 +350,9 @@ internal class CastControllerImpl @Inject constructor(
     /** Reloads [current] at its position with the subtitle file [uri] added and enabled. */
     private suspend fun reloadWithLocalSubtitle(uri: Uri, state: RemotePlaybackState, current: CastMedia): CastResult {
         loadGeneration++
+        loadsInFlight++
         proxyManager.acquire()
+        var failed = true
         try {
             val fileName = withContext(Dispatchers.IO) { localMedia.displayName(uri) }
             val vtt = withContext(Dispatchers.IO) { readSubtitleAsVtt(uri, SubtitleFormat.UNKNOWN, fileName) }
@@ -369,6 +376,7 @@ internal class CastControllerImpl @Inject constructor(
                 Log.w(TAG, "Reloading with subtitles failed", result.exceptionOrNull())
                 failure(CastErrorKind.LOAD_FAILED, R.string.cast_error_load_failed)
             } else {
+                failed = false
                 CastResult.Success
             }
         } catch (failure: CastFailure) {
@@ -379,8 +387,18 @@ internal class CastControllerImpl @Inject constructor(
             Log.w(TAG, "Reloading with subtitles failed", e)
             return failure(CastErrorKind.LOAD_FAILED, R.string.cast_error_load_failed)
         } finally {
+            loadsInFlight--
             proxyManager.release()
+            afterOwnLoad(failed)
         }
+    }
+
+    /**
+     * After a load other than a cast (a subtitle reload, a queue append): a failure's status is not reported
+     * besides the error its caller gets, and an error the load kept from being looked at is looked at now.
+     */
+    private fun afterOwnLoad(failed: Boolean) {
+        if (failed) noteFailedLoad() else onReceiverError(chromecast.playback.value)
     }
 
     override suspend fun savedPositionMs(originalUrl: String): Long? = try {
@@ -502,11 +520,7 @@ internal class CastControllerImpl @Inject constructor(
             val result = chromecast.load(batch.items, 0, startMs, autoplay = true)
             if (result.isFailure) {
                 Log.w(TAG, "Load failed", result.exceptionOrNull())
-                suppressReceiverErrorsUntil = SystemClock.elapsedRealtime() + RECEIVER_ERROR_SUPPRESS_MS
-                // Its failed status may have come before this reply: the caller gets the error, not an event too.
-                chromecast.playback.value
-                    ?.takeIf { it.idleReason == IDLE_REASON_ERROR }
-                    ?.let { lastReceiverErrorKey = errorKey(it) }
+                noteFailedLoad()
                 val problem = proxyManager.takeRecentProblem(
                     PROXY_PROBLEM_WINDOW_MS,
                     batch.items.mapNotNullTo(HashSet()) { StreamProxy.streamIdOf(it.contentUrl) },
@@ -838,21 +852,27 @@ internal class CastControllerImpl @Inject constructor(
             }
             return
         }
-        if (state.playerState in ACTIVE_STATES && state.positionMs > 0) {
+        // A position seen through a suspended session is the SDK's extrapolation, not the receiver's.
+        val connected = chromecast.connectionState.value == CastConnectionState.CONNECTED
+        if (connected && state.playerState in ACTIVE_STATES && state.positionMs > 0) {
             if (finishedUrl == url) finishedUrl = null
             lastProgress = Progress(url, state.positionMs, state.durationMs, state.isLive)
         }
     }
 
-    /** Notes the proxied item playing, for [recover]; a direct one clears it. */
+    /** Notes the proxied item playing, for a [ReceiverRecovery]; a direct one clears it. */
     private fun trackProxiedItem(state: RemotePlaybackState?) {
         if (state == null || state.playerState !in ACTIVE_STATES) return
+        // A state seen through a suspended session is stale: its position is the SDK's extrapolation from the last
+        // status while the receiver may have stalled and failed since, so the last trusted one is kept.
+        val connected = chromecast.connectionState.value == CastConnectionState.CONNECTED
         val contentUrl = state.contentUrl?.takeIf { StreamProxy.streamIdOf(it) != null }
         if (contentUrl == null) {
-            proxiedItem = null
+            if (connected) proxiedItem = null
             return
         }
         val previous = proxiedItem?.takeIf { it.contentUrl == contentUrl }
+        if (!connected && previous != null) return
         proxiedItem = ProxiedItem(
             contentUrl = contentUrl,
             originalUrl = state.originalUrl,
@@ -896,17 +916,25 @@ internal class CastControllerImpl @Inject constructor(
         val pageUrl = (current.originalUrl ?: item?.originalUrl)?.takeUnless { it in privateUrls }?.let(pagesByUrl::get)
         val streamIds = listOfNotNull((current.contentUrl ?: item?.contentUrl)?.let(StreamProxy::streamIdOf))
         val problem = proxyManager.takeRecentProblem(PROXY_PROBLEM_WINDOW_MS, streamIds)
-        val delayMs = item?.let { retryDelay(problem) }
-        if (item == null || delayMs == null) {
+        if (item == null || !recovery.mayRecover(connected = true, problem, proxyManager.receiverIdleMillis())) {
             reportReceiverError(problem, pageUrl)
             return
         }
         recovering = true
         scope.launch(Dispatchers.Main.immediate) {
-            try {
-                recover(item, current.currentItemId, delayMs, problem, pageUrl, streamIds)
+            val outcome = try {
+                recovery.recover(recoveryHost(item, streamIds), current.currentItemId, problem)
             } finally {
                 recovering = false
+            }
+            when (outcome) {
+                is ReceiverRecovery.Outcome.Failed -> {
+                    noteFailedLoad()
+                    reportReceiverError(outcome.problem, pageUrl)
+                }
+                // Ended without a report: the receiver's status is judged afresh, unless a newer load noted
+                // its own failure meanwhile.
+                else -> if (lastReceiverErrorKey == key) lastReceiverErrorKey = null
             }
             // Whatever the receiver came to show meanwhile (another item failing, say) is looked at as usual.
             onReceiverError(chromecast.playback.value)
@@ -915,77 +943,28 @@ internal class CastControllerImpl @Inject constructor(
 
     private fun errorKey(state: RemotePlaybackState): String = "${state.currentItemId}:${state.originalUrl}"
 
-    /** See [ReceiverRecovery.retryDelay]; counts an attempt when it returns a delay. */
-    private fun retryDelay(problem: StreamProblem?): Long? = recovery.retryDelay(
-        proxied = true,
-        connected = chromecast.connectionState.value == CastConnectionState.CONNECTED,
-        permanentProblem = problem != null && problem.kind != StreamProblem.Kind.UNREACHABLE,
-        receiverIdleMs = proxyManager.receiverIdleMillis(),
-    )
+    /** A load whose error its caller gets: its failed status, before or after the reply, is not reported too. */
+    private fun noteFailedLoad() {
+        suppressReceiverErrorsUntil = SystemClock.elapsedRealtime() + RECEIVER_ERROR_SUPPRESS_MS
+        chromecast.playback.value
+            ?.takeIf { it.idleReason == IDLE_REASON_ERROR }
+            ?.let { lastReceiverErrorKey = errorKey(it) }
+    }
 
     private fun reportReceiverError(problem: StreamProblem?, pageUrl: String?) {
         val message = problemMessage(problem) ?: string(R.string.cast_error_playback)
         _events.tryEmit(CastEvent.Error(CastErrorKind.LOAD_FAILED, message, pageUrl))
     }
 
-    /**
-     * Loads the proxied [item] the receiver failed on (as queue item [failedItemId]) again where it stopped,
-     * after [firstDelayMs], with the proxy started again if it had stopped; a reload that fails is tried again
-     * while [ReceiverRecovery] allows, and the error is reported once it does not. Gives up quietly when something
-     * else replaced the failed item meanwhile (a new cast, a Stop, another item); when the session is lost
-     * meanwhile, the failed status is looked at again once it comes back with the session.
-     */
-    private suspend fun recover(
-        item: ProxiedItem,
-        failedItemId: Int?,
-        firstDelayMs: Long,
-        firstProblem: StreamProblem?,
-        pageUrl: String?,
-        streamIds: List<String>,
-    ) {
-        var delayMs = firstDelayMs
-        var problem = firstProblem
-        var generation = loadGeneration
-        var reloadFailed = false
-        while (true) {
-            delay(delayMs)
-            if (chromecast.connectionState.value != CastConnectionState.CONNECTED) {
-                lastReceiverErrorKey = null
-                return
-            }
-            if (generation != loadGeneration || loadsInFlight > 0) return
-            val state = chromecast.playback.value
-            val stillFailed = if (reloadFailed) {
-                // The failed reload left its own idle item (a failed load may leave no reason), or nothing; not
-                // one stopped, finished or replaced since.
-                state == null || (state.playerState == RemotePlayerState.IDLE && state.idleReason !in ENDED_REASONS)
-            } else {
-                state != null && state.idleReason == IDLE_REASON_ERROR && state.currentItemId == failedItemId
-            }
-            if (!stillFailed) return
-            val own = loadGeneration + 1
-            val reloaded = reload(item) ?: break
-            if (reloaded) {
-                lastReceiverErrorKey = null
-                return
-            }
-            // A newer load (a cast, an append, a subtitle) started meanwhile: it replaced ours, not ours to report.
-            if (loadGeneration != own) return
-            // The session went away while it loaded: looked at again when it comes back.
-            if (chromecast.connectionState.value != CastConnectionState.CONNECTED) {
-                lastReceiverErrorKey = null
-                return
-            }
-            // The outage goes on, or the link has died meanwhile.
-            generation = loadGeneration
-            reloadFailed = true
-            problem = proxyManager.takeRecentProblem(PROXY_PROBLEM_WINDOW_MS, streamIds) ?: problem
-            delayMs = retryDelay(problem) ?: break
-        }
-        // Reported once: the failed status that follows a failed load is not reported again.
-        suppressReceiverErrorsUntil = SystemClock.elapsedRealtime() + RECEIVER_ERROR_SUPPRESS_MS
-        chromecast.playback.value?.let { lastReceiverErrorKey = errorKey(it) }
-        reportReceiverError(problem, pageUrl)
+    private fun recoveryHost(item: ProxiedItem, streamIds: List<String>) = object : ReceiverRecovery.Host {
+        override val connectionState get() = chromecast.connectionState
+        override val playback get() = chromecast.playback.value
+        override val loadGeneration get() = this@CastControllerImpl.loadGeneration
+        override val loadsInFlight get() = this@CastControllerImpl.loadsInFlight
+
+        override suspend fun reload(): Boolean? = this@CastControllerImpl.reload(item)
+
+        override fun takeProblem(): StreamProblem? = proxyManager.takeRecentProblem(PROXY_PROBLEM_WINDOW_MS, streamIds)
     }
 
     /**
@@ -1112,13 +1091,6 @@ internal class CastControllerImpl @Inject constructor(
         const val PROXY_PROBLEM_WINDOW_MS = 30_000L
         const val IDLE_REASON_FINISHED = ReceiverQueue.IDLE_REASON_FINISHED
         const val IDLE_REASON_ERROR = ReceiverQueue.IDLE_REASON_ERROR
-
-        /** Idle reasons of media someone ended (stopped, finished, replaced), as opposed to one that failed. */
-        val ENDED_REASONS = setOf(
-            ReceiverQueue.IDLE_REASON_CANCELED,
-            ReceiverQueue.IDLE_REASON_FINISHED,
-            ReceiverQueue.IDLE_REASON_INTERRUPTED,
-        )
 
         /** android.Manifest.permission.ACCESS_LOCAL_NETWORK (Android 17, API 37). */
         const val PERMISSION_ACCESS_LOCAL_NETWORK = "android.permission.ACCESS_LOCAL_NETWORK"
