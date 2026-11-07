@@ -123,6 +123,31 @@ class CastServiceKeeperTest {
     }
 
     @Test
+    fun `a receiver paused when the session is lost keeps its proxy for half an hour, not its locks`() = runTest {
+        val cast = Cast(this)
+        cast.playFromProxy()
+        advanceTimeBy(10 * MINUTE)
+        cast.receiverPlays = false
+        cast.player.value = RemotePlayerState.PAUSED
+        advanceTimeBy(MINUTE)
+        cast.connection.value = CastConnectionState.NO_DEVICES
+        cast.player.value = null
+        advanceTimeBy(5 * MINUTE)
+        assertThat(cast.locks.held).isFalse()
+        advanceTimeBy(20 * MINUTE)
+        assertThat(cast.stops).isEmpty()
+
+        // Resumed from the TV remote: the receiver fetches again and keeps the proxy up.
+        cast.playFromProxy()
+        advanceTimeBy(60 * MINUTE)
+        assertThat(cast.stops).isEmpty()
+        cast.receiverPlays = false
+        advanceTimeBy(ServiceStopPolicy.PAUSED_RECEIVER_IDLE_MS + SEGMENT_MS)
+        runCurrent()
+        assertThat(cast.stops).hasSize(1)
+    }
+
+    @Test
     fun `a Stop ends at once, even while the receiver was still fetching`() = runTest {
         val cast = Cast(this)
         cast.playFromProxy()

@@ -4,7 +4,6 @@ import app.snapcast.proxy.LocalSource
 import app.snapcast.proxy.ProxyStreamRequest
 import app.snapcast.proxy.SubtitleSource
 import java.security.SecureRandom
-import java.util.concurrent.ConcurrentHashMap
 
 /** Something the proxy serves under a random id. */
 internal sealed interface Registration {
@@ -20,30 +19,45 @@ internal sealed interface Registration {
     class Subtitle(val source: SubtitleSource, val policy: HeaderPolicy?) : Registration
 }
 
-/** Thread-safe id → [Registration] map. Ids are 128-bit random values in hex. */
+/**
+ * Thread-safe id → [Registration] map. Ids are 128-bit random values in hex. Registrations outlive casts (a
+ * receiver may come back to a stream after the phone lost its session), so only the [MAX_ENTRIES] most recent
+ * are kept.
+ */
 internal class Registry {
-    private val entries = ConcurrentHashMap<String, Registration>()
+    private val entries = object : LinkedHashMap<String, Registration>() {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Registration>?): Boolean = size > MAX_ENTRIES
+    }
     private val random = SecureRandom()
 
     /** Stores [registration] under a fresh id and returns it. */
     fun add(registration: Registration): String {
         while (true) {
             val id = newId()
-            if (entries.putIfAbsent(id, registration) == null) return id
+            synchronized(entries) {
+                if (id !in entries) {
+                    entries[id] = registration
+                    return id
+                }
+            }
         }
     }
 
-    fun stream(id: String?): Registration.Stream? = id?.let { entries[it] } as? Registration.Stream
+    fun stream(id: String?): Registration.Stream? = get(id) as? Registration.Stream
 
-    fun local(id: String?): Registration.Local? = id?.let { entries[it] } as? Registration.Local
+    fun local(id: String?): Registration.Local? = get(id) as? Registration.Local
 
-    fun subtitle(id: String?): Registration.Subtitle? = id?.let { entries[it] } as? Registration.Subtitle
+    fun subtitle(id: String?): Registration.Subtitle? = get(id) as? Registration.Subtitle
+
+    val size: Int get() = synchronized(entries) { entries.size }
 
     fun remove(id: String) {
-        entries.remove(id)
+        synchronized(entries) { entries.remove(id) }
     }
 
-    fun clear() = entries.clear()
+    fun clear() = synchronized(entries) { entries.clear() }
+
+    private fun get(id: String?): Registration? = id?.let { synchronized(entries) { entries[it] } }
 
     private fun newId(): String {
         val bytes = ByteArray(16)
@@ -56,7 +70,8 @@ internal class Registry {
         }
     }
 
-    private companion object {
-        const val HEX = "0123456789abcdef"
+    companion object {
+        const val MAX_ENTRIES = 256
+        private const val HEX = "0123456789abcdef"
     }
 }

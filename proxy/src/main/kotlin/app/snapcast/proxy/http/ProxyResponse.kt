@@ -120,6 +120,7 @@ internal class ProxyResponse(
             val read = body.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
             if (read < 0) throw EOFException("Body ended $remaining bytes early")
             out.write(buffer, 0, read)
+            activity?.progressed()
             remaining -= read
             if (body.available() <= 0) out.flush()
         }
@@ -136,6 +137,7 @@ internal class ProxyResponse(
             out.write(buffer, 0, read)
             out.write(CRLF)
             out.flush()
+            activity?.progressed()
         }
         out.write(LAST_CHUNK)
     }

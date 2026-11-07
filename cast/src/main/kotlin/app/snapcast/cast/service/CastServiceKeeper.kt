@@ -34,6 +34,9 @@ internal class CastServiceKeeper(
     private val locks: ServiceLocks,
     private val onStop: (reason: String) -> Unit,
 ) {
+    /** The receiver's last known state, kept when the session (and with it the state) is lost. */
+    private var lastKnown: RemotePlayerState? = null
+
     /** Holds the locks while the receiver plays; releases them a while after it pauses, stops or is lost. */
     fun observeLocks(): Job = scope.launch {
         playerState
@@ -48,7 +51,7 @@ internal class CastServiceKeeper(
                     }
                     WakeLockPolicy.Decision.RELEASE_WHEN_RECEIVER_IDLE -> {
                         delay(WakeLockPolicy.RELEASE_DELAY_MS)
-                        awaitReceiverIdle()
+                        awaitReceiverIdle(ServiceStopPolicy.RECEIVER_IDLE_MS)
                         locks.release()
                     }
                 }
@@ -57,11 +60,10 @@ internal class CastServiceKeeper(
 
     /** Calls [onStop] when the service should stop; each new decision replaces the pending one. */
     fun observeStop(): Job = scope.launch {
-        combine(
-            connectionState,
-            playerState.map { it != null && it != RemotePlayerState.IDLE }.distinctUntilChanged(),
-            endedOnPurpose,
-        ) { state, loaded, onPurpose -> ServiceStopPolicy.decide(state, loaded, onPurpose) }
+        combine(connectionState, playerState, endedOnPurpose) { state, player, onPurpose ->
+            if (player != null) lastKnown = player
+            ServiceStopPolicy.decide(state, player != null && player != RemotePlayerState.IDLE, onPurpose)
+        }
             .distinctUntilChanged()
             .collectLatest { decision ->
                 when (decision) {
@@ -73,7 +75,8 @@ internal class CastServiceKeeper(
                     }
                     ServiceStopPolicy.Decision.STOP_WHEN_RECEIVER_IDLE -> {
                         delay(ServiceStopPolicy.GRACE_MS)
-                        awaitReceiverIdle()
+                        val paused = lastKnown == RemotePlayerState.PAUSED
+                        awaitReceiverIdle(if (paused) ServiceStopPolicy.PAUSED_RECEIVER_IDLE_MS else ServiceStopPolicy.RECEIVER_IDLE_MS)
                         onStop("no session, and no receiver using the proxy")
                     }
                 }
@@ -81,14 +84,14 @@ internal class CastServiceKeeper(
     }
 
     /**
-     * Returns once no receiver has used the proxy for [ServiceStopPolicy.RECEIVER_IDLE_MS] (at once if none ever
-     * did). A receiver that lost its session with the phone goes on playing from the proxy, which must stay up.
+     * Returns once no receiver has used the proxy for [idleMs] (at once if none ever did). A receiver that lost
+     * its session with the phone goes on playing from the proxy, which must stay up.
      */
-    private suspend fun awaitReceiverIdle() {
+    private suspend fun awaitReceiverIdle(idleMs: Long) {
         while (true) {
             val idle = receiverIdleMillis() ?: return
-            if (idle >= ServiceStopPolicy.RECEIVER_IDLE_MS) return
-            delay(ServiceStopPolicy.RECEIVER_IDLE_MS - idle)
+            if (idle >= idleMs) return
+            delay(idleMs - idle)
         }
     }
 }

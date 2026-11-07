@@ -8,6 +8,7 @@ import okhttp3.Request
 import okio.Buffer
 import org.junit.After
 import org.junit.Test
+import java.net.ServerSocket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
@@ -33,6 +34,31 @@ class StreamProxyActivityTest {
         assertThat(afterRequest).isLessThan(5_000L)
         Thread.sleep(50)
         assertThat(harness.proxy.idleMillis()!!).isAtLeast(40L)
+    }
+
+    @Test
+    fun `a stopped and restarted proxy serves the streams it had, at the same URLs`() {
+        harness.origin.text("/v/master.m3u8", "#EXTM3U\n#EXTINF:4,\nseg.ts\n", "application/vnd.apple.mpegurl")
+        // The app's proxy listens on a fixed port (8642 by default), not an ephemeral one.
+        val port = ServerSocket(0).use { it.localPort }
+        val proxy = StreamProxy(harness.upstreamClient, ProxyConfig(port = port, bindAddress = "127.0.0.1", fallbackToEphemeralPort = false))
+        fun fetch(path: String) = harness.client.newCall(Request("http://127.0.0.1:$port$path".toHttpUrl())).execute().use { it.code to it.body.string() }
+        try {
+            proxy.start()
+            val stream = proxy.registerStream(ProxyStreamRequest(harness.origin.url("/v/master.m3u8"), emptyMap(), emptyMap(), StreamType.HLS))
+            val first = fetch(stream.path)
+            assertThat(first.first).isEqualTo(200)
+
+            proxy.stop()
+            proxy.start()
+            // Connections to the stopped server are dead; a receiver (Chromium) retries on a fresh one.
+            harness.client.connectionPool.evictAll()
+
+            assertThat(proxy.port).isEqualTo(port)
+            assertThat(fetch(stream.path)).isEqualTo(first)
+        } finally {
+            proxy.stop()
+        }
     }
 
     @Test

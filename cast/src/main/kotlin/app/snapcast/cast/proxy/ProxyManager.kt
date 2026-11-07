@@ -25,8 +25,10 @@ import javax.inject.Singleton
  * Owns the single [StreamProxy]. The server starts on demand ([proxy]) on the port from the settings and
  * is kept alive by references: the casting service holds one while casting, and the controller holds one
  * while it prepares a load. When the last reference goes, the server stops after a short grace period
- * (which also bridges the gap between a load and the service taking its reference). A port change in the
- * settings restarts the server the next time it is needed, as soon as nothing is casting.
+ * (which also bridges the gap between a load and the service taking its reference). The stopped proxy is
+ * kept, with its signing secret, port and registrations, and started again by [proxy] or [restartIfStopped]:
+ * the URLs a receiver still holds then work again, so a cast that outlived its service can be saved. A port
+ * change in the settings replaces it the next time it is needed, as soon as nothing is casting.
  */
 @Singleton
 internal class ProxyManager @Inject constructor(
@@ -63,10 +65,11 @@ internal class ProxyManager @Inject constructor(
         val port = settingsRepository.settings.value.proxyPort
         synchronized(lock) {
             val current = proxy
-            if (current != null && current.isRunning && (proxyPort == port || references > 0)) {
+            if (current != null && (proxyPort == port || references > 0)) {
+                if (!current.isRunning) current.start()
                 return@synchronized current
             }
-            current?.let { stopQuietly(it) }
+            current?.let { discardQuietly(it) }
             proxy = null
             val created = StreamProxy(
                 client = client,
@@ -85,10 +88,26 @@ internal class ProxyManager @Inject constructor(
         if (streamIds.isEmpty()) null else synchronized(lock) { proxy }?.takeRecentProblem(withinMs, streamIds)
 
     /**
-     * Milliseconds since a receiver last used the proxy (0 while it is answering one), or null when none did or
-     * the proxy is stopped. See [StreamProxy.idleMillis].
+     * Milliseconds since a receiver last used the proxy (0 while it is answering one), or null when none did.
+     * See [StreamProxy.idleMillis].
      */
     fun receiverIdleMillis(): Long? = synchronized(lock) { proxy }?.idleMillis()
+
+    /**
+     * Starts the kept proxy again if it was stopped (see the class comment); does nothing when there is none or it
+     * runs. Called by the casting service when it starts, so a resumed cast is served again.
+     */
+    suspend fun restartIfStopped() = withContext(Dispatchers.IO) {
+        synchronized(lock) {
+            val current = proxy ?: return@synchronized
+            if (current.isRunning) return@synchronized
+            try {
+                current.start()
+            } catch (e: IOException) {
+                Log.w(TAG, "Restarting the proxy failed", e)
+            }
+        }
+    }
 
     /** Keeps the proxy alive until the matching [release]. */
     fun acquire() {
@@ -114,18 +133,26 @@ internal class ProxyManager @Inject constructor(
 
     private fun stopIfPortChanged(port: Int) {
         synchronized(lock) {
-            if (references == 0 && proxy != null && proxyPort != port) stopLocked()
+            val current = proxy ?: return
+            if (references == 0 && proxyPort != port) {
+                proxy = null
+                proxyPort = -1
+                discardQuietly(current)
+            }
         }
     }
 
+    /** Stops the server but keeps the proxy (secret, port, registrations) to be started again. */
     private fun stopLocked() {
         val current = proxy ?: return
-        proxy = null
-        proxyPort = -1
-        stopQuietly(current)
+        try {
+            current.stop()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Stopping the proxy failed", e)
+        }
     }
 
-    private fun stopQuietly(proxy: StreamProxy) {
+    private fun discardQuietly(proxy: StreamProxy) {
         try {
             proxy.clear()
             proxy.stop()

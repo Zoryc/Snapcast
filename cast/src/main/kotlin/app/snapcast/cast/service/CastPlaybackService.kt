@@ -76,6 +76,10 @@ class CastPlaybackService : Service() {
     private var stopPolicyJob: Job? = null
     private var lastStartId = 0
     private var lastContent: CastNotificationContent? = null
+
+    /** What the receiver last reported, shown while the session is lost (it may play on meanwhile). */
+    private var lastKnownPlayback: RemotePlaybackState? = null
+    private var lastKnownDevice: CastDeviceInfo? = null
     private var lastMetadata: MetadataKey? = null
     private var lastSessionState: SessionStateKey? = null
     private var lastSessionPositionMs = 0L
@@ -107,6 +111,8 @@ class CastPlaybackService : Service() {
         }
         proxyManager.acquire()
         holdsProxy = true
+        // A session that outlived an earlier service is served again by the same proxy (same URLs).
+        scope.launch { proxyManager.restartIfStopped() }
         locks.acquire()
         keeper = CastServiceKeeper(
             scope = scope,
@@ -161,7 +167,14 @@ class CastPlaybackService : Service() {
     private fun observe() {
         scope.launch {
             combine(target.playback, target.device) { playback, device -> playback to device }
-                .collect { (playback, device) -> render(playback, device) }
+                .collect { (playback, device) ->
+                    // Without a session the receiver may play on from the proxy: the notification and the media
+                    // session keep its last state rather than going blank (Android 16 demotes the foreground service
+                    // of a media session that stays inactive for 10 minutes).
+                    if (playback != null) lastKnownPlayback = playback
+                    if (device != null) lastKnownDevice = device
+                    render(playback ?: lastKnownPlayback, device ?: lastKnownDevice)
+                }
         }
     }
 

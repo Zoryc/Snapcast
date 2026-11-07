@@ -28,6 +28,9 @@ internal object ServiceStopPolicy {
     /** A playing receiver fetches from the proxy every few seconds, or keeps a response open. */
     const val RECEIVER_IDLE_MS = 120_000L
 
+    /** A paused receiver fetches nothing until it resumes: its proxy is kept longer (not the locks). */
+    const val PAUSED_RECEIVER_IDLE_MS = 30 * 60_000L
+
     fun decide(state: CastConnectionState, mediaLoaded: Boolean, endedOnPurpose: Boolean): Decision = when (state) {
         CastConnectionState.CONNECTED -> if (mediaLoaded) Decision.KEEP else Decision.STOP_AFTER_GRACE
         CastConnectionState.CONNECTING -> Decision.STOP_WHEN_RECEIVER_IDLE
