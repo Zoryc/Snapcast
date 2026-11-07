@@ -123,6 +123,13 @@ interface CastTarget {
     /** Null when nothing is loaded on the receiver. */
     val playback: StateFlow<RemotePlaybackState?>
 
+    /**
+     * True once the last session was ended on purpose (a Stop that also stopped the receiver, or the receiver
+     * app closing), so the receiver fetches nothing more. False while a session runs and after one was lost (a
+     * network error, the phone no longer seeing the device): the receiver may then go on playing on its own.
+     */
+    val sessionEndedOnPurpose: StateFlow<Boolean>
+
     /** Replaces the receiver queue with [items] and starts [startIndex] at [startPositionMs]. */
     suspend fun load(items: List<CastMedia>, startIndex: Int = 0, startPositionMs: Long = 0, autoplay: Boolean = true): Result<Unit>
 

@@ -12,6 +12,7 @@ import app.snapcast.cast.RemotePlaybackState
 import app.snapcast.cast.RemotePlayerState
 import app.snapcast.data.di.ApplicationScope
 import com.google.android.gms.cast.Cast
+import com.google.android.gms.cast.CastStatusCodes
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaMetadata
@@ -63,6 +64,9 @@ internal class ChromecastTarget @Inject constructor(
     private val _playback = MutableStateFlow<RemotePlaybackState?>(null)
     override val playback: StateFlow<RemotePlaybackState?> = _playback.asStateFlow()
 
+    private val _sessionEndedOnPurpose = MutableStateFlow(false)
+    override val sessionEndedOnPurpose: StateFlow<Boolean> = _sessionEndedOnPurpose.asStateFlow()
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // Main-thread state.
@@ -78,9 +82,13 @@ internal class ChromecastTarget @Inject constructor(
     private val castStateListener = CastStateListener { refreshConnection() }
 
     private val sessionListener = object : SessionManagerListener<CastSession> {
-        override fun onSessionStarting(session: CastSession) = refreshConnection()
+        override fun onSessionStarting(session: CastSession) {
+            _sessionEndedOnPurpose.value = false
+            refreshConnection()
+        }
 
         override fun onSessionStarted(session: CastSession, sessionId: String) {
+            _sessionEndedOnPurpose.value = false
             attachSession(session)
             refreshConnection()
         }
@@ -93,6 +101,11 @@ internal class ChromecastTarget @Inject constructor(
         override fun onSessionEnding(session: CastSession) = Unit
 
         override fun onSessionEnded(session: CastSession, error: Int) {
+            // Ended normally (a Stop, here or from the system's cast dialog) or the receiver app closed: nothing
+            // plays on. Any other error is a lost session whose receiver may still be playing.
+            if (error == CastStatusCodes.SUCCESS || error == CastStatusCodes.APPLICATION_NOT_RUNNING) {
+                _sessionEndedOnPurpose.value = true
+            }
             detachSession()
             refreshConnection()
         }
@@ -100,6 +113,7 @@ internal class ChromecastTarget @Inject constructor(
         override fun onSessionResuming(session: CastSession, sessionId: String) = refreshConnection()
 
         override fun onSessionResumed(session: CastSession, wasSuspended: Boolean) {
+            _sessionEndedOnPurpose.value = false
             attachSession(session)
             refreshConnection()
         }
@@ -295,6 +309,8 @@ internal class ChromecastTarget @Inject constructor(
     }
 
     override fun disconnect(stopCasting: Boolean) = onMain {
+        // Ending without stopping the receiver leaves it playing, possibly from the proxy.
+        if (stopCasting) _sessionEndedOnPurpose.value = true
         castContext?.sessionManager?.endCurrentSession(stopCasting)
     }
 

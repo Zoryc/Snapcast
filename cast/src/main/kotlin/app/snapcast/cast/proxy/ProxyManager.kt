@@ -84,6 +84,12 @@ internal class ProxyManager @Inject constructor(
     fun takeRecentProblem(withinMs: Long, streamIds: Collection<String>): StreamProblem? =
         if (streamIds.isEmpty()) null else synchronized(lock) { proxy }?.takeRecentProblem(withinMs, streamIds)
 
+    /**
+     * Milliseconds since a receiver last used the proxy (0 while it is answering one), or null when none did or
+     * the proxy is stopped. See [StreamProxy.idleMillis].
+     */
+    fun receiverIdleMillis(): Long? = synchronized(lock) { proxy }?.idleMillis()
+
     /** Keeps the proxy alive until the matching [release]. */
     fun acquire() {
         synchronized(lock) {

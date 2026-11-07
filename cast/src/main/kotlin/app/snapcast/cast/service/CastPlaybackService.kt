@@ -161,6 +161,11 @@ class CastPlaybackService : Service() {
                             delay(WakeLockPolicy.RELEASE_DELAY_MS)
                             locks.release()
                         }
+                        WakeLockPolicy.Decision.RELEASE_WHEN_RECEIVER_IDLE -> {
+                            delay(WakeLockPolicy.RELEASE_DELAY_MS)
+                            awaitReceiverIdle()
+                            locks.release()
+                        }
                     }
                 }
         }
@@ -170,7 +175,8 @@ class CastPlaybackService : Service() {
         combine(
             target.connectionState,
             target.playback.map { it != null && it.playerState != RemotePlayerState.IDLE }.distinctUntilChanged(),
-        ) { state, loaded -> ServiceStopPolicy.decide(state, loaded) }
+            target.sessionEndedOnPurpose,
+        ) { state, loaded, endedOnPurpose -> ServiceStopPolicy.decide(state, loaded, endedOnPurpose) }
             .distinctUntilChanged()
             .collectLatest { decision ->
                 when (decision) {
@@ -180,8 +186,26 @@ class CastPlaybackService : Service() {
                         delay(ServiceStopPolicy.GRACE_MS)
                         shutdown()
                     }
+                    ServiceStopPolicy.Decision.STOP_WHEN_RECEIVER_IDLE -> {
+                        delay(ServiceStopPolicy.GRACE_MS)
+                        awaitReceiverIdle()
+                        Log.i(TAG, "No session and no receiver using the proxy: stopping")
+                        shutdown()
+                    }
                 }
             }
+    }
+
+    /**
+     * Returns once no receiver has used the proxy for [ServiceStopPolicy.RECEIVER_IDLE_MS] (at once if none ever
+     * did). A receiver that lost its session with the phone goes on playing from the proxy, which must stay up.
+     */
+    private suspend fun awaitReceiverIdle() {
+        while (true) {
+            val idle = proxyManager.receiverIdleMillis() ?: return
+            if (idle >= ServiceStopPolicy.RECEIVER_IDLE_MS) return
+            delay(ServiceStopPolicy.RECEIVER_IDLE_MS - idle)
+        }
     }
 
     // region Rendering

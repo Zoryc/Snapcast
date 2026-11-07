@@ -39,6 +39,9 @@ internal class ProxyResponse(
     private val headerLines = LinkedHashMap<String, Pair<String, String>>()
     private var keepAliveRequested = true
 
+    /** Told when this response starts and stops being sent (see [ProxyActivity]). */
+    var activity: ProxyActivity? = null
+
     init {
         Cors.HEADERS.forEach { (name, value) -> addHeader(name, value) }
     }
@@ -68,6 +71,16 @@ internal class ProxyResponse(
     }
 
     override fun send(outputStream: OutputStream) {
+        val activity = activity
+        activity?.begin()
+        try {
+            sendTracked(outputStream)
+        } finally {
+            activity?.end()
+        }
+    }
+
+    private fun sendTracked(outputStream: OutputStream) {
         val code = status.requestStatus
         val noBodyStatus = code < 200 || code == 204 || code == 304
         val sendBody = requestMethod != NanoHTTPD.Method.HEAD && !noBodyStatus

@@ -1,5 +1,6 @@
 package app.snapcast.proxy.server
 
+import app.snapcast.proxy.http.ProxyActivity
 import fi.iki.elonen.NanoHTTPD
 
 /**
@@ -13,12 +14,23 @@ internal class ProxyHttpServer(
     hostname: String?,
     port: Int,
     private val handler: ProxyHandler,
+    private val activity: ProxyActivity,
 ) : NanoHTTPD(hostname, port) {
 
     override fun serve(session: IHTTPSession): Response {
         val query = session.queryParameterString?.takeIf { session.parameters.isNotEmpty() }
         val request = ClientRequest(session.method, session.uri ?: "/", query, session.headers)
-        return handler.serve(request)
+        // Health checks come from the app, not from a receiver.
+        if (request.path.split('/').getOrNull(1) == ProxyRoutes.HEALTH) return handler.serve(request)
+        // In use while the answer is prepared (the upstream may be slow) and then while it is sent.
+        activity.begin()
+        val response = try {
+            handler.serve(request)
+        } finally {
+            activity.end()
+        }
+        response.activity = activity
+        return response
     }
 
     /** Media and playlists are never compressed by the proxy. */

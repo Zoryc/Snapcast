@@ -1,5 +1,6 @@
 package app.snapcast.proxy
 
+import app.snapcast.proxy.http.ProxyActivity
 import app.snapcast.proxy.server.HeaderPolicy
 import app.snapcast.proxy.server.ProxyHandler
 import app.snapcast.proxy.server.ProxyHttpServer
@@ -44,6 +45,7 @@ class StreamProxy(
     private val registry = Registry()
     private val routes: ProxyRoutes
     private val upstream = UpstreamClient(client)
+    private val activity = ProxyActivity()
     private val handler: ProxyHandler
     private val lock = Any()
 
@@ -135,6 +137,12 @@ class StreamProxy(
         return ProxiedSubtitle(id, routes.subtitle(id))
     }
 
+    /**
+     * Milliseconds since a receiver last used the proxy (0 while a response is being sent), or null if none has.
+     * A receiver keeps fetching from it while it plays, whether or not the phone still talks to it.
+     */
+    fun idleMillis(): Long? = activity.idleMillis()
+
     fun unregister(id: String) {
         registry.remove(id)
     }
@@ -161,7 +169,7 @@ class StreamProxy(
     private fun bind(port: Int): ProxyHttpServer {
         // NanoHTTPD binds on its listener thread and would wait forever if the address were rejected there.
         if (port !in 0..MAX_PORT) throw IOException("Invalid port $port")
-        val created = ProxyHttpServer(config.bindAddress.trim().ifEmpty { null }, port, handler)
+        val created = ProxyHttpServer(config.bindAddress.trim().ifEmpty { null }, port, handler, activity)
         try {
             created.start(NanoHTTPD.SOCKET_READ_TIMEOUT, true)
         } catch (e: IOException) {
