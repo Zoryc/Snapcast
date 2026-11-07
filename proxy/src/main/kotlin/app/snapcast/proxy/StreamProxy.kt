@@ -41,13 +41,18 @@ class StreamProxy(
     /** HMAC key; random per instance when null. */
     secret: ByteArray? = null,
     private val log: (String) -> Unit = {},
-    /** Told of each receiver request (not health checks), on the server's thread: keep it cheap. */
-    onRequest: () -> Unit = {},
+    /**
+     * Told when a receiver uses the proxy after a minute or more without (health checks aside), on a server
+     * thread: keep it cheap. See [idleMillis].
+     */
+    onReceiverActive: () -> Unit = {},
+    /** Milliseconds for [idleMillis]: a clock that neither jumps nor stops while the device sleeps. */
+    activityClock: () -> Long = { System.nanoTime() / 1_000_000L },
 ) {
     private val registry = Registry()
     private val routes: ProxyRoutes
     private val upstream = UpstreamClient(client)
-    private val activity = ProxyActivity(onRequest = onRequest)
+    private val activity = ProxyActivity(clock = activityClock, onActive = onReceiverActive)
     private val handler: ProxyHandler
     private val lock = Any()
 

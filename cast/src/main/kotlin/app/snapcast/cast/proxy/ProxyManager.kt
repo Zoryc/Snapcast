@@ -1,6 +1,7 @@
 package app.snapcast.cast.proxy
 
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import app.snapcast.data.di.ApplicationScope
 import app.snapcast.data.settings.SettingsRepository
@@ -54,10 +55,13 @@ internal class ProxyManager @Inject constructor(
     private var proxyPort = -1
     private var references = 0
     private var stopJob: Job? = null
-    private val requestCount = MutableStateFlow(0L)
+    private val activeCount = MutableStateFlow(0L)
 
-    /** Emits when a receiver request reaches the proxy, from the time it is collected (no replay). */
-    val receiverRequests: Flow<Long> = requestCount.drop(1)
+    /**
+     * Emits when a receiver uses the proxy again after a minute or more without (see StreamProxy), from the time
+     * it is collected (no replay).
+     */
+    val receiverActive: Flow<Long> = activeCount.drop(1)
 
     init {
         scope.launch {
@@ -86,7 +90,10 @@ internal class ProxyManager @Inject constructor(
                 client = client,
                 config = ProxyConfig(port = port, defaultUserAgent = defaultUserAgent),
                 log = ::log,
-                onRequest = { requestCount.update { it + 1 } },
+                onReceiverActive = { activeCount.update { it + 1 } },
+                // Goes on in deep sleep (the receiver may play on for an hour with the screen off) and ignores
+                // clock changes.
+                activityClock = SystemClock::elapsedRealtime,
             )
             created.start()
             proxy = created

@@ -114,19 +114,30 @@ class StreamProxyActivityTest {
     }
 
     @Test
-    fun `each receiver request is reported, health checks are not`() {
-        val requests = AtomicInteger()
-        val proxy = StreamProxy(harness.upstreamClient, ProxyConfig(port = 0, bindAddress = "127.0.0.1"), onRequest = { requests.incrementAndGet() })
+    fun `a receiver coming back after a minute or more is reported, health checks are not`() {
+        val comebacks = AtomicInteger()
+        var now = 1_000_000L
+        val proxy = StreamProxy(
+            harness.upstreamClient,
+            ProxyConfig(port = 0, bindAddress = "127.0.0.1"),
+            onReceiverActive = { comebacks.incrementAndGet() },
+            activityClock = { now },
+        )
         harness.origin.text("/v/master.m3u8", "#EXTM3U\n#EXTINF:4,\nseg.ts\n", "application/vnd.apple.mpegurl")
         fun fetch(path: String) = harness.client.newCall(Request("http://127.0.0.1:${proxy.port}$path".toHttpUrl())).execute().use { it.code }
         try {
             proxy.start()
             assertThat(fetch("/health")).isEqualTo(200)
-            assertThat(requests.get()).isEqualTo(0)
+            assertThat(comebacks.get()).isEqualTo(0)
             val stream = proxy.registerStream(ProxyStreamRequest(harness.origin.url("/v/master.m3u8"), emptyMap(), emptyMap(), StreamType.HLS))
             fetch(stream.path)
+            assertThat(comebacks.get()).isEqualTo(1)
+            now += 6_000L
             fetch(stream.path)
-            assertThat(requests.get()).isEqualTo(2)
+            assertThat(comebacks.get()).isEqualTo(1)
+            now += 3 * 60_000L
+            fetch(stream.path)
+            assertThat(comebacks.get()).isEqualTo(2)
         } finally {
             proxy.stop()
         }

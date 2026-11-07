@@ -10,10 +10,16 @@ import java.util.concurrent.atomic.AtomicInteger
  * Every [begin] is matched by an [end]. Thread-safe.
  */
 internal class ProxyActivity(
-    /** Wall-clock milliseconds: unlike System.nanoTime on Android, it goes on while the phone sleeps. */
-    private val clock: () -> Long = System::currentTimeMillis,
-    /** Told of each receiver request, on the server's thread. */
-    private val onRequest: () -> Unit = {},
+    /**
+     * Milliseconds on a clock that neither jumps nor stops while the phone sleeps (SystemClock.elapsedRealtime
+     * on Android; System.nanoTime, which stops in deep sleep there, elsewhere).
+     */
+    private val clock: () -> Long = { System.nanoTime() / NANOS_PER_MILLI },
+    /**
+     * Told, on a server thread, when a receiver uses the proxy after not using it for [ACTIVE_GAP_MS], or for the
+     * first time: a new request, or bytes moving again on a response that had stopped.
+     */
+    private val onActive: () -> Unit = {},
 ) {
     private val busy = AtomicInteger()
 
@@ -22,12 +28,6 @@ internal class ProxyActivity(
 
     @Volatile
     private var used = false
-
-    /** A receiver request arrived: in use until the matching [end]. */
-    fun request() {
-        begin()
-        onRequest()
-    }
 
     fun begin() {
         busy.incrementAndGet()
@@ -50,11 +50,18 @@ internal class ProxyActivity(
     }
 
     private fun touch() {
-        lastAt = clock()
+        val now = clock()
+        val comingBack = !used || now - lastAt >= ACTIVE_GAP_MS
+        lastAt = now
         used = true
+        if (comingBack) onActive()
     }
 
     companion object {
         const val STALLED_MS = 10 * 60_000L
+
+        /** Shorter than the casting service's idle limits, so coming back after any of them is reported. */
+        const val ACTIVE_GAP_MS = 60_000L
+        private const val NANOS_PER_MILLI = 1_000_000L
     }
 }

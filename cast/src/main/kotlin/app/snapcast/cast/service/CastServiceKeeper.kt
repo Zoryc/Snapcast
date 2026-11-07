@@ -29,7 +29,8 @@ internal interface ServiceLocks {
  * When the casting service holds its locks ([WakeLockPolicy]) and when it stops ([ServiceStopPolicy]), from the
  * receiver's session ([connectionState], [playerState]: null while nothing is known to be loaded,
  * [endedOnPurpose]) and from its use of the proxy ([receiverIdleMillis], see ProxyManager.receiverIdleMillis;
- * [receiverRequests] emits when a receiver request reaches the proxy, not replaying earlier ones).
+ * [receiverActive] emits when a receiver uses the proxy again after a minute or more without, not replaying
+ * earlier ones).
  * No Android types, so the timing is tested on its own; runs on [scope] (the service's main-thread scope).
  */
 internal class CastServiceKeeper(
@@ -38,13 +39,17 @@ internal class CastServiceKeeper(
     private val playerState: Flow<RemotePlayerState?>,
     private val endedOnPurpose: Flow<Boolean>,
     private val receiverIdleMillis: () -> Long?,
-    private val receiverRequests: Flow<*>,
+    private val receiverActive: Flow<*>,
     private val locks: ServiceLocks,
     private val onStop: (reason: String) -> Unit,
 ) {
     /** Holds the locks while the receiver plays; releases them a while after it pauses, stops or is lost. */
     fun observeLocks(): Job = scope.launch {
-        playerState
+        // A state seen through a suspended session is stale (the receiver may have been paused or resumed from
+        // the TV since): only a connected session's state is trusted.
+        combine(connectionState, playerState) { connection, player ->
+            if (connection == CastConnectionState.CONNECTED) player else null
+        }
             .map(WakeLockPolicy::decide)
             .distinctUntilChanged()
             .collectLatest { decision ->
@@ -59,15 +64,15 @@ internal class CastServiceKeeper(
                     }
                     WakeLockPolicy.Decision.RELEASE_WHEN_RECEIVER_IDLE -> {
                         // The receiver's state is unknown: follow its use of the proxy, which goes on (or resumes
-                        // after a pause on the TV) without the phone being told.
-                        delay(WakeLockPolicy.RELEASE_DELAY_MS)
+                        // after a pause on the TV) without the phone being told. Event-driven once released: a
+                        // delay would not run while the phone sleeps.
                         while (true) {
                             if (receiverIdleMillis()?.let { it < WakeLockPolicy.RECEIVER_IDLE_MS } == true) {
                                 locks.acquire()
                                 renewing { awaitReceiverIdle(WakeLockPolicy.RECEIVER_IDLE_MS) }
                             }
                             locks.release()
-                            receiverRequests.first()
+                            receiverActive.first()
                         }
                     }
                 }

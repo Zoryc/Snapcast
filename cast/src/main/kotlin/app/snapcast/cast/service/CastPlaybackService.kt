@@ -124,7 +124,7 @@ class CastPlaybackService : Service() {
             playerState = target.playback.map { it?.playerState },
             endedOnPurpose = target.sessionEndedOnPurpose,
             receiverIdleMillis = proxyManager::receiverIdleMillis,
-            receiverRequests = proxyManager.receiverRequests,
+            receiverActive = proxyManager.receiverActive,
             locks = locks,
             onStop = { reason ->
                 Log.i(TAG, "Stopping: $reason")

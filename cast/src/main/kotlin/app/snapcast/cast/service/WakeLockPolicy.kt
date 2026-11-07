@@ -18,7 +18,7 @@ internal object WakeLockPolicy {
         /** Paused or idle: release unless playback resumes within [RELEASE_DELAY_MS]. */
         RELEASE_AFTER_DELAY,
 
-        /** No session (lost, or none yet): hold them while the receiver uses the proxy. */
+        /** No connected session (lost, suspended, or none yet): hold them while the receiver uses the proxy. */
         RELEASE_WHEN_RECEIVER_IDLE,
     }
 

@@ -44,7 +44,8 @@ class CastServiceKeeperTest {
         val endedOnPurpose = MutableStateFlow(false)
         val locks = Locks(scope)
         val stops = mutableListOf<Pair<Long, String>>()
-        val requests = MutableSharedFlow<Unit>(extraBufferCapacity = 16)
+        /** What the proxy reports: the receiver using it again after a minute or more without. */
+        val comebacks = MutableSharedFlow<Unit>(extraBufferCapacity = 16)
 
         /** When the receiver last fetched from the proxy (virtual ms), or null if it never did. */
         var lastFetchAt: Long? = null
@@ -61,7 +62,7 @@ class CastServiceKeeperTest {
             receiverIdleMillis = {
                 if (holdingResponse) 0L else lastFetchAt?.let { scope.testScheduler.currentTime - it }
             },
-            receiverRequests = requests,
+            receiverActive = comebacks,
             locks = locks,
             onStop = { reason -> stops += scope.testScheduler.currentTime to reason },
         )
@@ -77,8 +78,10 @@ class CastServiceKeeperTest {
             receiverPlays = true
             scope.backgroundScope.launch {
                 while (receiverPlays) {
-                    lastFetchAt = scope.testScheduler.currentTime
-                    requests.tryEmit(Unit)
+                    val now = scope.testScheduler.currentTime
+                    val last = lastFetchAt
+                    if (last == null || now - last >= ACTIVE_GAP_MS) comebacks.tryEmit(Unit)
+                    lastFetchAt = now
                     delay(everyMs)
                 }
             }
@@ -238,6 +241,50 @@ class CastServiceKeeperTest {
     }
 
     @Test
+    fun `a receiver resumed from the TV right after the session is lost gets the locks back at once`() = runTest {
+        val cast = Cast(this)
+        cast.playFromProxy()
+        advanceTimeBy(10 * MINUTE)
+        cast.receiverPlays = false
+        cast.player.value = RemotePlayerState.PAUSED
+        advanceTimeBy(3 * MINUTE)
+        assertThat(cast.locks.held).isFalse()
+        cast.connection.value = CastConnectionState.NO_DEVICES
+        cast.player.value = null
+        advanceTimeBy(10_000L)
+        // No waiting first: a delay would not run while the phone sleeps.
+        cast.playFromProxy()
+        runCurrent()
+        assertThat(cast.locks.held).isTrue()
+    }
+
+    @Test
+    fun `during a suspension the stale state does not decide the locks, the receiver's use of the proxy does`() = runTest {
+        val cast = Cast(this)
+        cast.playFromProxy()
+        advanceTimeBy(10 * MINUTE)
+        cast.receiverPlays = false
+        cast.player.value = RemotePlayerState.PAUSED
+        advanceTimeBy(3 * MINUTE)
+        assertThat(cast.locks.held).isFalse()
+
+        // Suspended: the phone still shows PAUSED, but the receiver is resumed from the TV.
+        cast.connection.value = CastConnectionState.CONNECTING
+        cast.playFromProxy()
+        runCurrent()
+        assertThat(cast.locks.held).isTrue()
+
+        // Still suspended, now showing PLAYING (as it was): the receiver stops, so the locks go.
+        cast.connection.value = CastConnectionState.CONNECTED
+        cast.player.value = RemotePlayerState.PLAYING
+        runCurrent()
+        cast.connection.value = CastConnectionState.CONNECTING
+        cast.receiverPlays = false
+        advanceTimeBy(WakeLockPolicy.RECEIVER_IDLE_MS + SEGMENT_MS)
+        assertThat(cast.locks.held).isFalse()
+    }
+
+    @Test
     fun `the locks' time limit is renewed through a long cast, with or without a session`() = runTest {
         val cast = Cast(this)
         cast.playFromProxy()
@@ -257,5 +304,8 @@ class CastServiceKeeperTest {
     private companion object {
         const val MINUTE = 60_000L
         const val SEGMENT_MS = 6_000L
+
+        /** ProxyActivity.ACTIVE_GAP_MS. */
+        const val ACTIVE_GAP_MS = 60_000L
     }
 }

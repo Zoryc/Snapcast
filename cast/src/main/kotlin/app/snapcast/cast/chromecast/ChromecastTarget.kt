@@ -261,8 +261,9 @@ internal class ChromecastTarget @Inject constructor(
     }
 
     /**
-     * Replaces the current item with [media] at [positionMs], keeping the rest of the queue: inserted after
-     * the current item and played, then the old item is removed. A single item is simply reloaded.
+     * Replaces the current item with [media] at [positionMs] (0: the receiver's default start, a live stream's
+     * live edge), keeping the rest of the queue: inserted after the current item and played, then the old item
+     * is removed. A single item is simply reloaded.
      */
     suspend fun replaceCurrent(media: CastMedia, positionMs: Long, autoplay: Boolean): Result<Unit> =
         withContext(Dispatchers.Main.immediate) {
@@ -274,7 +275,13 @@ internal class ChromecastTarget @Inject constructor(
             }
             val beforeId = QueuePositions.insertBeforeId(ids, currentId) ?: MediaQueueItem.INVALID_ITEM_ID
             val item = MediaInfoMapper.toQueueItem(media, startPositionMs = positionMs)
-            val result = remote.queueInsertAndPlayItem(item, beforeId, positionMs.coerceAtLeast(0), null).awaitResult()
+            // Without a position the receiver starts at its default: the beginning, or a live stream's live edge.
+            val pending = if (positionMs > 0) {
+                remote.queueInsertAndPlayItem(item, beforeId, positionMs, null)
+            } else {
+                remote.queueInsertAndPlayItem(item, beforeId, null)
+            }
+            val result = pending.awaitResult()
             if (result.isSuccess) {
                 remote.queueRemoveItem(currentId, null)
                 if (!autoplay) remote.pause()

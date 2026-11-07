@@ -23,7 +23,7 @@ internal class ProxyHttpServer(
         // Health checks come from the app, not from a receiver.
         if (request.path.split('/').getOrNull(1) == ProxyRoutes.HEALTH) return handler.serve(request)
         // In use while the answer is prepared (the upstream may be slow) and then while it is sent.
-        activity.request()
+        activity.begin()
         val response = try {
             handler.serve(request)
         } finally {
