@@ -29,6 +29,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -91,6 +94,7 @@ class CastPlaybackService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        _running.value = true
         notifications = CastNotificationFactory(this).also { it.ensureChannel() }
         artwork = ArtworkLoader(okHttpClient)
         locks = CastLocks(this)
@@ -150,6 +154,7 @@ class CastPlaybackService : Service() {
             holdsProxy = false
             proxyManager.release()
         }
+        _running.value = false
         super.onDestroy()
     }
 
@@ -374,6 +379,11 @@ class CastPlaybackService : Service() {
     }
 
     companion object {
+        private val _running = MutableStateFlow(false)
+
+        /** Whether the service exists (it holds the proxy): the controller restarts it for a session that outlived it. */
+        internal val running: StateFlow<Boolean> = _running.asStateFlow()
+
         internal const val ACTION_TOGGLE_PLAYBACK = "app.snapcast.cast.action.TOGGLE_PLAYBACK"
         internal const val ACTION_REWIND = "app.snapcast.cast.action.REWIND"
         internal const val ACTION_FORWARD = "app.snapcast.cast.action.FORWARD"

@@ -164,6 +164,9 @@ internal class CastControllerImpl @Inject constructor(
     private var finishedUrl: String? = null
     private var lastReceiverErrorKey: String? = null
     private var serviceRequested = false
+
+    /** When [ensureServiceForResumedSession] last started the service: a service that keeps failing is not looped. */
+    private var serviceRestartedAt = Long.MIN_VALUE / 2
     private var inBandSubtitleSelection: Job? = null
     private val privateUrls = HashSet<String>()
 
@@ -181,6 +184,16 @@ internal class CastControllerImpl @Inject constructor(
         scope.launch(Dispatchers.Main.immediate) { observeConnection() }
         scope.launch(Dispatchers.Main.immediate) { observePlayback() }
         scope.launch(Dispatchers.Main.immediate) { savePositionsWhilePlaying() }
+        scope.launch(Dispatchers.Main.immediate) {
+            // The service stopped (nothing loaded, or a lost session whose receiver stopped using the proxy): a
+            // session that comes back with media loaded gets it again, now or once the app is visible.
+            CastPlaybackService.running.collect { running ->
+                if (!running) {
+                    serviceRequested = false
+                    ensureServiceForResumedSession(chromecast.playback.value)
+                }
+            }
+        }
         scope.launch(Dispatchers.Main.immediate) {
             // Retries a casting service that couldn't start from the background once the app is visible again
             // (playback updates alone stop while the receiver is paused).
@@ -820,13 +833,17 @@ internal class CastControllerImpl @Inject constructor(
     }
 
     /**
-     * A session resumed after an app restart, or one whose casting service could not be started from the
-     * background, gets its service (proxy, locks, notification) back while the app is visible.
+     * A session resumed after an app restart, one whose casting service could not be started from the
+     * background, or one that outlived its service gets the service (proxy, locks, notification) back while the
+     * app is visible. Not for an idle receiver: the service would stop again after its grace period.
      */
     private fun ensureServiceForResumedSession(state: RemotePlaybackState?) {
-        if (state == null || serviceRequested) return
+        if (state == null || state.playerState == RemotePlayerState.IDLE || serviceRequested) return
         if (chromecast.connectionState.value != CastConnectionState.CONNECTED) return
         if (!ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - serviceRestartedAt < SERVICE_RESTART_INTERVAL_MS) return
+        serviceRestartedAt = now
         startPlaybackService()
     }
 
@@ -903,6 +920,9 @@ internal class CastControllerImpl @Inject constructor(
         const val RECEIVER_ERROR_SUPPRESS_MS = 5_000L
         const val IN_BAND_TRACK_WAIT_MS = 20_000L
         const val MAX_PAGES_BY_URL = 32
+
+        /** Shortest time between two automatic restarts of the casting service. */
+        const val SERVICE_RESTART_INTERVAL_MS = 30_000L
 
         /** How recent a proxy problem must be to explain a receiver error. */
         const val PROXY_PROBLEM_WINDOW_MS = 30_000L

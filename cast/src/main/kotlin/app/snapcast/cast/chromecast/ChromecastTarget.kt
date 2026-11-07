@@ -2,6 +2,7 @@ package app.snapcast.cast.chromecast
 
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import app.snapcast.cast.CastConnectionState
 import app.snapcast.cast.CastDeviceInfo
 import app.snapcast.cast.CastMedia
@@ -88,12 +89,14 @@ internal class ChromecastTarget @Inject constructor(
         }
 
         override fun onSessionStarted(session: CastSession, sessionId: String) {
+            Log.i(TAG, "Session started")
             _sessionEndedOnPurpose.value = false
             attachSession(session)
             refreshConnection()
         }
 
         override fun onSessionStartFailed(session: CastSession, error: Int) {
+            Log.i(TAG, "Session start failed: ${CastStatusCodes.getStatusCodeString(error)}")
             detachSession()
             refreshConnection()
         }
@@ -101,29 +104,38 @@ internal class ChromecastTarget @Inject constructor(
         override fun onSessionEnding(session: CastSession) = Unit
 
         override fun onSessionEnded(session: CastSession, error: Int) {
-            // Ended normally (a Stop, here or from the system's cast dialog) or the receiver app closed: nothing
-            // plays on. Any other error is a lost session whose receiver may still be playing.
-            if (error == CastStatusCodes.SUCCESS || error == CastStatusCodes.APPLICATION_NOT_RUNNING) {
-                _sessionEndedOnPurpose.value = true
-            }
+            Log.i(TAG, "Session ended: ${CastStatusCodes.getStatusCodeString(error)}")
+            // The receiver app closed: nothing plays on. Every other end may leave the receiver playing (the SDK
+            // reports success for any end started from the phone, a lost session given up included), so only a
+            // Stop from this app (disconnect) counts as on purpose besides this.
+            if (error == CastStatusCodes.APPLICATION_NOT_RUNNING) _sessionEndedOnPurpose.value = true
             detachSession()
             refreshConnection()
         }
 
-        override fun onSessionResuming(session: CastSession, sessionId: String) = refreshConnection()
+        override fun onSessionResuming(session: CastSession, sessionId: String) {
+            Log.i(TAG, "Session resuming")
+            refreshConnection()
+        }
 
         override fun onSessionResumed(session: CastSession, wasSuspended: Boolean) {
+            Log.i(TAG, "Session resumed (was suspended: $wasSuspended)")
             _sessionEndedOnPurpose.value = false
             attachSession(session)
             refreshConnection()
         }
 
         override fun onSessionResumeFailed(session: CastSession, error: Int) {
+            Log.i(TAG, "Session resume failed: ${CastStatusCodes.getStatusCodeString(error)}")
             detachSession()
             refreshConnection()
         }
 
-        override fun onSessionSuspended(session: CastSession, reason: Int) = refreshConnection()
+        override fun onSessionSuspended(session: CastSession, reason: Int) {
+            // Connection lost (screen off, Wi-Fi power save, out of range): the receiver plays on meanwhile.
+            Log.i(TAG, "Session suspended: ${CastStatusCodes.getStatusCodeString(reason)}")
+            refreshConnection()
+        }
     }
 
     private val mediaCallback = object : RemoteMediaClient.Callback() {
@@ -333,6 +345,7 @@ internal class ChromecastTarget @Inject constructor(
     private fun refreshConnection() {
         val context = castContext ?: return
         val current = context.sessionManager.currentCastSession
+        val previous = _connectionState.value
         _connectionState.value = when (context.castState) {
             CastState.CONNECTED -> if (current != null && current.isConnected) {
                 attachSession(current)
@@ -353,6 +366,7 @@ internal class ChromecastTarget @Inject constructor(
                 CastConnectionState.NOT_CONNECTED
             }
         }
+        if (_connectionState.value != previous) Log.i(TAG, "Connection: $previous -> ${_connectionState.value}")
     }
 
     private fun attachSession(newSession: CastSession) {
@@ -488,6 +502,7 @@ internal class ChromecastTarget @Inject constructor(
     private fun notConnected(): Result<Unit> = Result.failure(CastRequestException("Not connected to a Cast device"))
 
     private companion object {
+        const val TAG = "SnapcastCast"
         const val TARGET_ID = "chromecast"
         const val DISPLAY_NAME = "Chromecast"
         const val PROGRESS_INTERVAL_MS = 1_000L
