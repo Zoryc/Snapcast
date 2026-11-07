@@ -4,9 +4,9 @@ import app.snapcast.cast.CastConnectionState
 
 /**
  * When the casting service may stop. While the phone has no session with the receiver (suspended, lost to a
- * network error, the device out of sight with the screen off), the receiver may go on playing: from the proxy,
- * which stops with the service, so it then stops only once no receiver has used the proxy for
- * [RECEIVER_IDLE_MS]. A session ended on purpose stops it at once.
+ * network error, the device out of sight with the screen off), the receiver may go on playing, or be paused and
+ * resumed from the TV: from the proxy, which stops with the service, so it then stops only once no receiver has
+ * used the proxy for [RECEIVER_IDLE_MS]. A session ended on purpose stops it at once.
  */
 internal object ServiceStopPolicy {
     enum class Decision {
@@ -25,11 +25,11 @@ internal object ServiceStopPolicy {
 
     const val GRACE_MS = 30_000L
 
-    /** A playing receiver fetches from the proxy every few seconds, or keeps a response open. */
-    const val RECEIVER_IDLE_MS = 120_000L
-
-    /** A paused receiver fetches nothing until it resumes: its proxy is kept longer (not the locks). */
-    const val PAUSED_RECEIVER_IDLE_MS = 30 * 60_000L
+    /**
+     * A playing receiver fetches from the proxy every few seconds, or keeps a response open; a paused one
+     * fetches nothing until it resumes, and the phone cannot tell the two apart without a session.
+     */
+    const val RECEIVER_IDLE_MS = 30 * 60_000L
 
     fun decide(state: CastConnectionState, mediaLoaded: Boolean, endedOnPurpose: Boolean): Decision = when (state) {
         CastConnectionState.CONNECTED -> if (mediaLoaded) Decision.KEEP else Decision.STOP_AFTER_GRACE

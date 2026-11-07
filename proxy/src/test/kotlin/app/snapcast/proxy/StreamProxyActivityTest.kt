@@ -11,6 +11,7 @@ import org.junit.Test
 import java.net.ServerSocket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /** The proxy says when a receiver last used it: the casting service keeps it up while one does. */
@@ -85,5 +86,49 @@ class StreamProxyActivityTest {
         assertThat(harness.proxy.idleMillis()).isEqualTo(0L)
         release.countDown()
         reader.join(15_000)
+    }
+
+    @Test
+    fun `a proxy that had to fall back to another port gets that port back when restarted`() {
+        harness.origin.text("/v/master.m3u8", "#EXTM3U\n#EXTINF:4,\nseg.ts\n", "application/vnd.apple.mpegurl")
+        ServerSocket(0).use { taken ->
+            val proxy = StreamProxy(harness.upstreamClient, ProxyConfig(port = taken.localPort, bindAddress = "127.0.0.1"))
+            try {
+                proxy.start()
+                val fallback = proxy.port
+                assertThat(fallback).isNotEqualTo(taken.localPort)
+                val stream = proxy.registerStream(ProxyStreamRequest(harness.origin.url("/v/master.m3u8"), emptyMap(), emptyMap(), StreamType.HLS))
+
+                proxy.stop()
+                proxy.start()
+                harness.client.connectionPool.evictAll()
+
+                // The receiver's URLs name the fallback port.
+                assertThat(proxy.port).isEqualTo(fallback)
+                val code = harness.client.newCall(Request("http://127.0.0.1:$fallback${stream.path}".toHttpUrl())).execute().use { it.code }
+                assertThat(code).isEqualTo(200)
+            } finally {
+                proxy.stop()
+            }
+        }
+    }
+
+    @Test
+    fun `each receiver request is reported, health checks are not`() {
+        val requests = AtomicInteger()
+        val proxy = StreamProxy(harness.upstreamClient, ProxyConfig(port = 0, bindAddress = "127.0.0.1"), onRequest = { requests.incrementAndGet() })
+        harness.origin.text("/v/master.m3u8", "#EXTM3U\n#EXTINF:4,\nseg.ts\n", "application/vnd.apple.mpegurl")
+        fun fetch(path: String) = harness.client.newCall(Request("http://127.0.0.1:${proxy.port}$path".toHttpUrl())).execute().use { it.code }
+        try {
+            proxy.start()
+            assertThat(fetch("/health")).isEqualTo(200)
+            assertThat(requests.get()).isEqualTo(0)
+            val stream = proxy.registerStream(ProxyStreamRequest(harness.origin.url("/v/master.m3u8"), emptyMap(), emptyMap(), StreamType.HLS))
+            fetch(stream.path)
+            fetch(stream.path)
+            assertThat(requests.get()).isEqualTo(2)
+        } finally {
+            proxy.stop()
+        }
     }
 }

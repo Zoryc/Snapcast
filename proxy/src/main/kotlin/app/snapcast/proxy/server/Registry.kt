@@ -21,11 +21,11 @@ internal sealed interface Registration {
 
 /**
  * Thread-safe id → [Registration] map. Ids are 128-bit random values in hex. Registrations outlive casts (a
- * receiver may come back to a stream after the phone lost its session), so only the [MAX_ENTRIES] most recent
- * are kept.
+ * receiver may come back to a stream after the phone lost its session), so only the [MAX_ENTRIES] most recently
+ * used are kept: every request looks its registration up, so a stream being played is never the one dropped.
  */
 internal class Registry {
-    private val entries = object : LinkedHashMap<String, Registration>() {
+    private val entries = object : LinkedHashMap<String, Registration>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Registration>?): Boolean = size > MAX_ENTRIES
     }
     private val random = SecureRandom()

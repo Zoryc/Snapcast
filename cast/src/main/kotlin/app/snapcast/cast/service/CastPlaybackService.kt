@@ -120,6 +120,7 @@ class CastPlaybackService : Service() {
             playerState = target.playback.map { it?.playerState },
             endedOnPurpose = target.sessionEndedOnPurpose,
             receiverIdleMillis = proxyManager::receiverIdleMillis,
+            receiverRequests = proxyManager.receiverRequests,
             locks = locks,
             onStop = { reason ->
                 Log.i(TAG, "Stopping: $reason")
@@ -191,7 +192,6 @@ class CastPlaybackService : Service() {
         if (playback != null) {
             val steps = VolumeSteps.toSteps(playback.volume)
             if (volumeProvider.currentVolume != steps) volumeProvider.currentVolume = steps
-            if (WakeLockPolicy.decide(playback.playerState) == WakeLockPolicy.Decision.HOLD) locks.refresh()
         }
         updateMetadata(playback)
         val content = notificationContent(playback, device)

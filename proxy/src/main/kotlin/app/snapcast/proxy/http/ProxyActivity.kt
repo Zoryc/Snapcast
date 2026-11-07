@@ -9,7 +9,12 @@ import java.util.concurrent.atomic.AtomicInteger
  * receiver that vanished without closing, its connection stuck until the kernel gives up) stops counting.
  * Every [begin] is matched by an [end]. Thread-safe.
  */
-internal class ProxyActivity(private val clock: () -> Long = { System.nanoTime() / NANOS_PER_MILLI }) {
+internal class ProxyActivity(
+    /** Wall-clock milliseconds: unlike System.nanoTime on Android, it goes on while the phone sleeps. */
+    private val clock: () -> Long = System::currentTimeMillis,
+    /** Told of each receiver request, on the server's thread. */
+    private val onRequest: () -> Unit = {},
+) {
     private val busy = AtomicInteger()
 
     @Volatile
@@ -17,6 +22,12 @@ internal class ProxyActivity(private val clock: () -> Long = { System.nanoTime()
 
     @Volatile
     private var used = false
+
+    /** A receiver request arrived: in use until the matching [end]. */
+    fun request() {
+        begin()
+        onRequest()
+    }
 
     fun begin() {
         busy.incrementAndGet()
@@ -45,6 +56,5 @@ internal class ProxyActivity(private val clock: () -> Long = { System.nanoTime()
 
     companion object {
         const val STALLED_MS = 10 * 60_000L
-        private const val NANOS_PER_MILLI = 1_000_000L
     }
 }

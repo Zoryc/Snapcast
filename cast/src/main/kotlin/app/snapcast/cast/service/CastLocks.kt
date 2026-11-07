@@ -31,10 +31,10 @@ internal class CastLocks(context: Context) : ServiceLocks {
     }
 
     /**
-     * Extends the wake lock's timeout while playback continues (it is time-limited so a lost release cannot
-     * drain the battery). Cheap to call often: it only renews once half of the timeout has passed.
+     * Extends the wake lock's timeout while it is held (it is time-limited so a lost release cannot drain the
+     * battery). Cheap to call often: it only renews once half of the timeout has passed.
      */
-    fun refresh() {
+    override fun refresh() {
         val lock = wakeLock ?: return
         val renewDue = SystemClock.elapsedRealtime() - wakeLockAcquiredAt > WAKE_LOCK_TIMEOUT_MS / 2
         if (lock.isHeld && renewDue) acquireWakeLock()

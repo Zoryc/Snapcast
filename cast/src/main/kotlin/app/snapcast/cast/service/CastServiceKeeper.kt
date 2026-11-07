@@ -4,11 +4,14 @@ import app.snapcast.cast.CastConnectionState
 import app.snapcast.cast.RemotePlayerState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
@@ -17,12 +20,16 @@ internal interface ServiceLocks {
     fun acquire()
 
     fun release()
+
+    /** Renews the time limit of the locks while they are held. */
+    fun refresh()
 }
 
 /**
  * When the casting service holds its locks ([WakeLockPolicy]) and when it stops ([ServiceStopPolicy]), from the
  * receiver's session ([connectionState], [playerState]: null while nothing is known to be loaded,
- * [endedOnPurpose]) and from its use of the proxy ([receiverIdleMillis], see ProxyManager.receiverIdleMillis).
+ * [endedOnPurpose]) and from its use of the proxy ([receiverIdleMillis], see ProxyManager.receiverIdleMillis;
+ * [receiverRequests] emits when a receiver request reaches the proxy, not replaying earlier ones).
  * No Android types, so the timing is tested on its own; runs on [scope] (the service's main-thread scope).
  */
 internal class CastServiceKeeper(
@@ -31,12 +38,10 @@ internal class CastServiceKeeper(
     private val playerState: Flow<RemotePlayerState?>,
     private val endedOnPurpose: Flow<Boolean>,
     private val receiverIdleMillis: () -> Long?,
+    private val receiverRequests: Flow<*>,
     private val locks: ServiceLocks,
     private val onStop: (reason: String) -> Unit,
 ) {
-    /** The receiver's last known state, kept when the session (and with it the state) is lost. */
-    private var lastKnown: RemotePlayerState? = null
-
     /** Holds the locks while the receiver plays; releases them a while after it pauses, stops or is lost. */
     fun observeLocks(): Job = scope.launch {
         playerState
@@ -44,15 +49,26 @@ internal class CastServiceKeeper(
             .distinctUntilChanged()
             .collectLatest { decision ->
                 when (decision) {
-                    WakeLockPolicy.Decision.HOLD -> locks.acquire()
+                    WakeLockPolicy.Decision.HOLD -> {
+                        locks.acquire()
+                        renewing { awaitCancellation() }
+                    }
                     WakeLockPolicy.Decision.RELEASE_AFTER_DELAY -> {
                         delay(WakeLockPolicy.RELEASE_DELAY_MS)
                         locks.release()
                     }
                     WakeLockPolicy.Decision.RELEASE_WHEN_RECEIVER_IDLE -> {
+                        // The receiver's state is unknown: follow its use of the proxy, which goes on (or resumes
+                        // after a pause on the TV) without the phone being told.
                         delay(WakeLockPolicy.RELEASE_DELAY_MS)
-                        awaitReceiverIdle(ServiceStopPolicy.RECEIVER_IDLE_MS)
-                        locks.release()
+                        while (true) {
+                            if (receiverIdleMillis()?.let { it < WakeLockPolicy.RECEIVER_IDLE_MS } == true) {
+                                locks.acquire()
+                                renewing { awaitReceiverIdle(WakeLockPolicy.RECEIVER_IDLE_MS) }
+                            }
+                            locks.release()
+                            receiverRequests.first()
+                        }
                     }
                 }
             }
@@ -61,7 +77,6 @@ internal class CastServiceKeeper(
     /** Calls [onStop] when the service should stop; each new decision replaces the pending one. */
     fun observeStop(): Job = scope.launch {
         combine(connectionState, playerState, endedOnPurpose) { state, player, onPurpose ->
-            if (player != null) lastKnown = player
             ServiceStopPolicy.decide(state, player != null && player != RemotePlayerState.IDLE, onPurpose)
         }
             .distinctUntilChanged()
@@ -75,23 +90,43 @@ internal class CastServiceKeeper(
                     }
                     ServiceStopPolicy.Decision.STOP_WHEN_RECEIVER_IDLE -> {
                         delay(ServiceStopPolicy.GRACE_MS)
-                        val paused = lastKnown == RemotePlayerState.PAUSED
-                        awaitReceiverIdle(if (paused) ServiceStopPolicy.PAUSED_RECEIVER_IDLE_MS else ServiceStopPolicy.RECEIVER_IDLE_MS)
+                        awaitReceiverIdle(ServiceStopPolicy.RECEIVER_IDLE_MS)
                         onStop("no session, and no receiver using the proxy")
                     }
                 }
             }
     }
 
+    /** Runs [block], renewing the locks' time limit meanwhile (a cast can outlast it). */
+    private suspend fun <T> renewing(block: suspend () -> T): T = coroutineScope {
+        val renewal = launch {
+            while (true) {
+                delay(LOCK_RENEWAL_MS)
+                locks.refresh()
+            }
+        }
+        try {
+            block()
+        } finally {
+            renewal.cancel()
+        }
+    }
+
     /**
-     * Returns once no receiver has used the proxy for [idleMs] (at once if none ever did). A receiver that lost
-     * its session with the phone goes on playing from the proxy, which must stay up.
+     * Returns once no receiver has used the proxy for [idleMs] (at once if none ever did). The idle time is
+     * wall-clock time, while delays stop with the phone asleep: it is checked at least every [IDLE_CHECK_MS] of
+     * awake time, so a wait that ran out during sleep ends soon after the phone wakes.
      */
     private suspend fun awaitReceiverIdle(idleMs: Long) {
         while (true) {
             val idle = receiverIdleMillis() ?: return
             if (idle >= idleMs) return
-            delay(idleMs - idle)
+            delay((idleMs - idle).coerceAtMost(IDLE_CHECK_MS))
         }
+    }
+
+    private companion object {
+        const val LOCK_RENEWAL_MS = 30 * 60_000L
+        const val IDLE_CHECK_MS = 60_000L
     }
 }

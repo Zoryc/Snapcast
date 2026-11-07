@@ -5,7 +5,7 @@ import org.junit.Test
 
 class ProxyActivityTest {
     private var now = 1_000L
-    private val activity = ProxyActivity { now }
+    private val activity = ProxyActivity(clock = { now })
 
     @Test
     fun `idle time counts from the end of the last request, and is zero while one is answered`() {

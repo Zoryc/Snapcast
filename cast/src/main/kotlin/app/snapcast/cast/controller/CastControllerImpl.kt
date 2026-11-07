@@ -152,11 +152,29 @@ internal class CastControllerImpl @Inject constructor(
     /** A failure carrying the user-facing result. */
     private class CastFailure(val kind: CastErrorKind, override val message: String) : Exception(message)
 
+    /**
+     * The proxied item last seen playing (or paused), where it was and whether it played, and its media once
+     * read from the receiver: what [recover] loads again when the receiver fails on it.
+     */
+    private data class ProxiedItem(
+        val contentUrl: String,
+        val originalUrl: String?,
+        val itemId: Int?,
+        val positionMs: Long,
+        val paused: Boolean,
+        val isLive: Boolean,
+        val media: CastMedia? = null,
+    )
+
     // Main-thread state.
     private var pendingRequest: CastRequest? = null
     private var pendingExpiry: Job? = null
-    private var loadInFlight = false
+    /** LOADs being sent (casts, subtitle reloads, recoveries): receiver errors meanwhile are about the old media. */
+    private var loadsInFlight = 0
     private var suppressReceiverErrorsUntil = 0L
+    private var proxiedItem: ProxiedItem? = null
+    private val recovery = ReceiverRecovery(SystemClock::elapsedRealtime)
+    private var recovering = false
 
     /** Counts the LOADs sent; a load that failed because a newer one replaced it must not be retried. */
     private var loadGeneration = 0
@@ -255,7 +273,7 @@ internal class CastControllerImpl @Inject constructor(
             if (video.isDrmProtected) return@withContext failure(CastErrorKind.DRM, R.string.cast_error_drm)
             val connected = chromecast.connectionState.value == CastConnectionState.CONNECTED
             val state = chromecast.playback.value
-            if (connected && state != null && !loadInFlight && ReceiverQueue.isEnded(state)) {
+            if (connected && state != null && loadsInFlight == 0 && ReceiverQueue.isEnded(state)) {
                 // The receiver's queue is over (finished, stopped or failed): an appended item would never play,
                 // so play it now. This resumes it, sends the pending queue along and starts the casting service.
                 val request = CastRequest.Remote(video, variant, subtitle = null, direct = false, startPositionMs = null)
@@ -467,7 +485,7 @@ internal class CastControllerImpl @Inject constructor(
     private suspend fun execute(request: CastRequest): CastResult {
         val generation = ++loadGeneration
         proxyManager.acquire()
-        loadInFlight = true
+        loadsInFlight++
         inBandSubtitleSelection?.cancel()
         try {
             val batch = buildBatch(request)
@@ -516,7 +534,7 @@ internal class CastControllerImpl @Inject constructor(
             Log.w(TAG, "Load failed", e)
             return failure(CastErrorKind.LOAD_FAILED, R.string.cast_error_load_failed)
         } finally {
-            loadInFlight = false
+            loadsInFlight--
             proxyManager.release()
         }
     }
@@ -790,7 +808,8 @@ internal class CastControllerImpl @Inject constructor(
     private suspend fun observePlayback() {
         chromecast.playback.collect { state ->
             trackProgress(state)
-            reportReceiverError(state)
+            trackProxiedItem(state)
+            onReceiverError(state)
             ensureServiceForResumedSession(state)
         }
     }
@@ -818,18 +837,112 @@ internal class CastControllerImpl @Inject constructor(
         }
     }
 
-    private fun reportReceiverError(state: RemotePlaybackState?) {
+    /** Notes the proxied item playing, for [recover]; a direct one clears it. */
+    private fun trackProxiedItem(state: RemotePlaybackState?) {
+        if (state == null || state.playerState !in ACTIVE_STATES) return
+        val contentUrl = state.contentUrl?.takeIf { StreamProxy.streamIdOf(it) != null }
+        if (contentUrl == null) {
+            proxiedItem = null
+            return
+        }
+        val previous = proxiedItem?.takeIf { it.contentUrl == contentUrl }
+        proxiedItem = ProxiedItem(
+            contentUrl = contentUrl,
+            originalUrl = state.originalUrl,
+            itemId = state.currentItemId,
+            positionMs = state.positionMs,
+            paused = state.playerState == RemotePlayerState.PAUSED,
+            isLive = state.isLive,
+            media = previous?.media,
+        )
+        if (previous == null) {
+            // Read once per item, while the receiver still has it (a failed one may not).
+            scope.launch(Dispatchers.Main.immediate) {
+                val media = chromecast.currentMedia()?.takeIf { it.contentUrl == contentUrl } ?: return@launch
+                proxiedItem = proxiedItem?.takeIf { it.contentUrl == contentUrl }?.copy(media = media)
+            }
+        }
+    }
+
+    /** The receiver failed on its item: a proxied one that may play again is reloaded, otherwise the error is told. */
+    private fun onReceiverError(state: RemotePlaybackState?) {
         val current = state ?: return
-        if (current.idleReason != IDLE_REASON_ERROR || loadInFlight) return
+        if (current.idleReason != IDLE_REASON_ERROR || loadsInFlight > 0 || recovering) return
         if (SystemClock.elapsedRealtime() < suppressReceiverErrorsUntil) return
         val key = "${current.currentItemId}:${current.originalUrl}"
         if (key == lastReceiverErrorKey) return
         lastReceiverErrorKey = key
-        val pageUrl = current.originalUrl?.takeUnless { it in privateUrls }?.let(pagesByUrl::get)
-        val streamIds = listOfNotNull(current.contentUrl?.let(StreamProxy::streamIdOf))
-        val message = problemMessage(proxyManager.takeRecentProblem(PROXY_PROBLEM_WINDOW_MS, streamIds))
-            ?: string(R.string.cast_error_playback)
+        // The failed item: the proxied one last seen playing, unless the receiver names another (a failed
+        // status may not carry its media).
+        val item = proxiedItem?.takeIf { item ->
+            (current.contentUrl == null || current.contentUrl == item.contentUrl) &&
+                (current.currentItemId == null || item.itemId == null || current.currentItemId == item.itemId)
+        }
+        val pageUrl = (current.originalUrl ?: item?.originalUrl)?.takeUnless { it in privateUrls }?.let(pagesByUrl::get)
+        val streamIds = listOfNotNull((current.contentUrl ?: item?.contentUrl)?.let(StreamProxy::streamIdOf))
+        val problem = proxyManager.takeRecentProblem(PROXY_PROBLEM_WINDOW_MS, streamIds)
+        val delayMs = recovery.retryDelay(
+            proxied = item != null,
+            connected = chromecast.connectionState.value == CastConnectionState.CONNECTED,
+            permanentProblem = problem != null && problem.kind != StreamProblem.Kind.UNREACHABLE,
+            receiverIdleMs = proxyManager.receiverIdleMillis(),
+        )
+        if (item != null && delayMs != null) {
+            recovering = true
+            scope.launch(Dispatchers.Main.immediate) {
+                try {
+                    if (!recover(item, current.currentItemId, delayMs)) reportReceiverError(problem, pageUrl)
+                } finally {
+                    recovering = false
+                }
+            }
+            return
+        }
+        reportReceiverError(problem, pageUrl)
+    }
+
+    private fun reportReceiverError(problem: StreamProblem?, pageUrl: String?) {
+        val message = problemMessage(problem) ?: string(R.string.cast_error_playback)
         _events.tryEmit(CastEvent.Error(CastErrorKind.LOAD_FAILED, message, pageUrl))
+    }
+
+    /**
+     * Loads the proxied [item] the receiver failed on (as queue item [failedItemId]) again where it stopped,
+     * after [delayMs], with the proxy started again if it had stopped. False when it could not be (it is then
+     * reported); true when it was, or when something else replaced it meanwhile (a new cast, a Stop, the
+     * session ending).
+     */
+    private suspend fun recover(item: ProxiedItem, failedItemId: Int?, delayMs: Long): Boolean {
+        val generation = loadGeneration
+        delay(delayMs)
+        val state = chromecast.playback.value
+        val stillFailed = state != null && state.idleReason == IDLE_REASON_ERROR && state.currentItemId == failedItemId &&
+            chromecast.connectionState.value == CastConnectionState.CONNECTED
+        if (!stillFailed || generation != loadGeneration || loadsInFlight > 0) return true
+        loadGeneration++
+        loadsInFlight++
+        proxyManager.acquire()
+        try {
+            proxyManager.restartIfStopped()
+            val media = chromecast.currentMedia()?.takeIf { it.contentUrl == item.contentUrl } ?: item.media ?: return false
+            val positionMs = if (item.isLive) 0L else item.positionMs
+            Log.i(TAG, "The receiver failed on a proxied stream; loading it again at $positionMs ms")
+            val result = chromecast.replaceCurrent(media, positionMs, autoplay = !item.paused)
+            if (result.isFailure) {
+                Log.w(TAG, "Loading the stream again failed", result.exceptionOrNull())
+                return false
+            }
+            lastReceiverErrorKey = null
+            return true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Loading the stream again failed", e)
+            return false
+        } finally {
+            loadsInFlight--
+            proxyManager.release()
+        }
     }
 
     /**

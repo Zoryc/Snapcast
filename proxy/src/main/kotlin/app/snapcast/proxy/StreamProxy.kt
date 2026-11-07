@@ -41,16 +41,21 @@ class StreamProxy(
     /** HMAC key; random per instance when null. */
     secret: ByteArray? = null,
     private val log: (String) -> Unit = {},
+    /** Told of each receiver request (not health checks), on the server's thread: keep it cheap. */
+    onRequest: () -> Unit = {},
 ) {
     private val registry = Registry()
     private val routes: ProxyRoutes
     private val upstream = UpstreamClient(client)
-    private val activity = ProxyActivity()
+    private val activity = ProxyActivity(onRequest = onRequest)
     private val handler: ProxyHandler
     private val lock = Any()
 
     @Volatile
     private var server: ProxyHttpServer? = null
+
+    /** The port last bound, tried first on a restart: a receiver's URLs name it (it may be an ephemeral fallback). */
+    private var lastBoundPort = -1
 
     init {
         val key = secret?.takeIf { it.isNotEmpty() } ?: ByteArray(SECRET_BYTES).also { SecureRandom().nextBytes(it) }
@@ -96,13 +101,15 @@ class StreamProxy(
             if (server?.isAlive == true) return
             server?.stop()
             server = null
-            server = try {
+            val previous = lastBoundPort.takeIf { it > 0 && it != config.port }
+            server = previous?.let { runCatching { bind(it) }.getOrNull() } ?: try {
                 bind(config.port)
             } catch (e: IOException) {
                 if (!config.fallbackToEphemeralPort || config.port == 0) throw e
                 log("Port ${config.port} unavailable (${e.message}); binding an ephemeral port")
                 bind(0)
             }
+            lastBoundPort = server?.listeningPort ?: -1
             log("Proxy listening on ${config.bindAddress}:$port")
         }
     }

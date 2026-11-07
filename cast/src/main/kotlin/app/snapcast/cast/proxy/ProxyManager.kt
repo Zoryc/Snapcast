@@ -11,8 +11,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -28,7 +32,7 @@ import javax.inject.Singleton
  * (which also bridges the gap between a load and the service taking its reference). The stopped proxy is
  * kept, with its signing secret, port and registrations, and started again by [proxy] or [restartIfStopped]:
  * the URLs a receiver still holds then work again, so a cast that outlived its service can be saved. A port
- * change in the settings replaces it the next time it is needed, as soon as nothing is casting.
+ * change in the settings replaces it as soon as nothing is casting.
  */
 @Singleton
 internal class ProxyManager @Inject constructor(
@@ -36,7 +40,10 @@ internal class ProxyManager @Inject constructor(
     private val settingsRepository: SettingsRepository,
     @ApplicationScope private val scope: CoroutineScope,
 ) {
+    // Shorter than the receiver's own patience (about 10 s for an answer): an upstream that hangs gets a quick
+    // error, which the receiver retries on a new request and the proxy records, rather than a receiver timeout.
     private val client: OkHttpClient = okHttpClient.newBuilder()
+        .connectTimeout(CONNECT_TIMEOUT_S, TimeUnit.SECONDS)
         .readTimeout(READ_TIMEOUT_S, TimeUnit.SECONDS)
         .build()
 
@@ -47,6 +54,10 @@ internal class ProxyManager @Inject constructor(
     private var proxyPort = -1
     private var references = 0
     private var stopJob: Job? = null
+    private val requestCount = MutableStateFlow(0L)
+
+    /** Emits when a receiver request reaches the proxy, from the time it is collected (no replay). */
+    val receiverRequests: Flow<Long> = requestCount.drop(1)
 
     init {
         scope.launch {
@@ -75,6 +86,7 @@ internal class ProxyManager @Inject constructor(
                 client = client,
                 config = ProxyConfig(port = port, defaultUserAgent = defaultUserAgent),
                 log = ::log,
+                onRequest = { requestCount.update { it + 1 } },
             )
             created.start()
             proxy = created
@@ -142,9 +154,18 @@ internal class ProxyManager @Inject constructor(
         }
     }
 
-    /** Stops the server but keeps the proxy (secret, port, registrations) to be started again. */
+    /**
+     * Stops the server but keeps the proxy (secret, port, registrations) to be started again, unless the port
+     * setting changed while it was in use: then it is replaced the next time it is needed.
+     */
     private fun stopLocked() {
         val current = proxy ?: return
+        if (settingsRepository.settings.value.proxyPort != proxyPort) {
+            proxy = null
+            proxyPort = -1
+            discardQuietly(current)
+            return
+        }
         try {
             current.stop()
         } catch (e: RuntimeException) {
@@ -167,7 +188,8 @@ internal class ProxyManager @Inject constructor(
 
     private companion object {
         const val TAG = "SnapcastProxy"
-        const val READ_TIMEOUT_S = 60L
+        const val CONNECT_TIMEOUT_S = 8L
+        const val READ_TIMEOUT_S = 20L
         const val STOP_GRACE_MS = 15_000L
     }
 }

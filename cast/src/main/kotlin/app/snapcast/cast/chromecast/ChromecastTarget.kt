@@ -1,8 +1,10 @@
 package app.snapcast.cast.chromecast
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import androidx.mediarouter.media.MediaRouter
 import app.snapcast.cast.CastConnectionState
 import app.snapcast.cast.CastDeviceInfo
 import app.snapcast.cast.CastMedia
@@ -13,6 +15,7 @@ import app.snapcast.cast.RemotePlaybackState
 import app.snapcast.cast.RemotePlayerState
 import app.snapcast.data.di.ApplicationScope
 import com.google.android.gms.cast.Cast
+import com.google.android.gms.cast.CastDevice
 import com.google.android.gms.cast.CastStatusCodes
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
@@ -28,6 +31,7 @@ import com.google.android.gms.cast.framework.CastStateListener
 import com.google.android.gms.cast.framework.SessionManagerListener
 import com.google.android.gms.cast.framework.media.MediaQueue
 import com.google.android.gms.cast.framework.media.RemoteMediaClient
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -48,6 +52,7 @@ import javax.inject.Singleton
  */
 @Singleton
 internal class ChromecastTarget @Inject constructor(
+    @ApplicationContext private val appContext: Context,
     private val castContextProvider: CastContextProvider,
     @ApplicationScope private val scope: CoroutineScope,
 ) : CastTarget {
@@ -133,8 +138,23 @@ internal class ChromecastTarget @Inject constructor(
 
         override fun onSessionSuspended(session: CastSession, reason: Int) {
             // Connection lost (screen off, Wi-Fi power save, out of range): the receiver plays on meanwhile.
-            Log.i(TAG, "Session suspended: ${CastStatusCodes.getStatusCodeString(reason)}")
+            Log.i(TAG, "Session suspended: ${suspensionReason(reason)}")
             refreshConnection()
+        }
+    }
+
+    /**
+     * "Stop casting" in the Cast dialog or the system's media output switcher: the receiver is stopped, but the
+     * SDK reports a plain end, as it does for a lost session it gave up on. Only a connected session can be
+     * stopped this way, which tells the two apart.
+     */
+    private val routerCallback = object : MediaRouter.Callback() {
+        override fun onRouteUnselected(router: MediaRouter, route: MediaRouter.RouteInfo, reason: Int) {
+            if (reason != MediaRouter.UNSELECT_REASON_STOPPED || CastDevice.getFromBundle(route.extras) == null) return
+            if (_connectionState.value == CastConnectionState.CONNECTED) {
+                Log.i(TAG, "Stopped from the route dialog")
+                _sessionEndedOnPurpose.value = true
+            }
         }
     }
 
@@ -338,6 +358,11 @@ internal class ChromecastTarget @Inject constructor(
         castContext = context
         context.sessionManager.addSessionManagerListener(sessionListener, CastSession::class.java)
         context.addCastStateListener(castStateListener)
+        // No discovery flags: this only listens, the Cast framework runs discovery.
+        context.mergedSelector?.let { selector ->
+            runCatching { MediaRouter.getInstance(appContext).addCallback(selector, routerCallback) }
+                .onFailure { Log.w(TAG, "Route callback unavailable", it) }
+        }
         context.sessionManager.currentCastSession?.takeIf { it.isConnected }?.let(::attachSession)
         refreshConnection()
     }
@@ -508,6 +533,16 @@ internal class ChromecastTarget @Inject constructor(
         const val PROGRESS_INTERVAL_MS = 1_000L
         const val MIN_PLAYBACK_RATE = 0.5
         const val MAX_PLAYBACK_RATE = 2.0
+
+        /** CastSession's suspension reasons (Cast.Listener's), not status codes. */
+        fun suspensionReason(reason: Int): String = when (reason) {
+            SUSPEND_SERVICE_DISCONNECTED -> "Play services disconnected"
+            SUSPEND_NETWORK_LOST -> "network lost"
+            else -> "reason $reason"
+        }
+
+        const val SUSPEND_SERVICE_DISCONNECTED = 1
+        const val SUSPEND_NETWORK_LOST = 2
 
         fun playerState(state: Int): RemotePlayerState = when (state) {
             MediaStatus.PLAYER_STATE_PLAYING -> RemotePlayerState.PLAYING

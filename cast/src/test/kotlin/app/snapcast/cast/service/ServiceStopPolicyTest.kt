@@ -24,7 +24,7 @@ class ServiceStopPolicyTest {
             assertThat(ServiceStopPolicy.decide(state, mediaLoaded = true, endedOnPurpose = false))
                 .isEqualTo(ServiceStopPolicy.Decision.STOP_WHEN_RECEIVER_IDLE)
         }
-        assertThat(ServiceStopPolicy.RECEIVER_IDLE_MS).isEqualTo(120_000L)
+        assertThat(ServiceStopPolicy.RECEIVER_IDLE_MS).isEqualTo(30 * 60_000L)
     }
 
     @Test
