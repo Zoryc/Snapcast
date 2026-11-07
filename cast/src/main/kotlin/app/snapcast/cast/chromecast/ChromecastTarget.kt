@@ -253,6 +253,12 @@ internal class ChromecastTarget @Inject constructor(
         }
     }
 
+    /** Identifies the Cast session (main thread): kept through a suspension, new for every session. */
+    val sessionToken: Any? get() = session
+
+    /** True when the receiver holds media (main thread): a queue append then only queues, it does not load. */
+    val holdsMedia: Boolean get() = client?.let(::hasMedia) == true
+
     /** The current item rebuilt from the receiver's media info, or null when nothing (of ours) is loaded. */
     suspend fun currentMedia(): CastMedia? = withContext(Dispatchers.Main.immediate) {
         val remote = client ?: return@withContext null
@@ -263,9 +269,14 @@ internal class ChromecastTarget @Inject constructor(
     /**
      * Replaces the current item with [media] at [positionMs] (0: the receiver's default start, a live stream's
      * live edge), keeping the rest of the queue: inserted after the current item and played, then the old item
-     * is removed. A single item is simply reloaded.
+     * is removed. A single item is simply reloaded. [replacingFailed]: the current item failed (a recovery).
      */
-    suspend fun replaceCurrent(media: CastMedia, positionMs: Long, autoplay: Boolean): Result<Unit> =
+    suspend fun replaceCurrent(
+        media: CastMedia,
+        positionMs: Long,
+        autoplay: Boolean,
+        replacingFailed: Boolean = false,
+    ): Result<Unit> =
         withContext(Dispatchers.Main.immediate) {
             val remote = client ?: return@withContext notConnected()
             val ids = queueItemIds(remote)
@@ -274,8 +285,9 @@ internal class ChromecastTarget @Inject constructor(
                 return@withContext load(listOf(media), startPositionMs = positionMs, autoplay = autoplay)
             }
             val beforeId = QueuePositions.insertBeforeId(ids, currentId) ?: MediaQueueItem.INVALID_ITEM_ID
-            val currentFailed = remote.mediaStatus?.let {
-                it.playerState == MediaStatus.PLAYER_STATE_IDLE && it.idleReason == MediaStatus.IDLE_REASON_ERROR
+            // A failed load may leave its item idle without a reason.
+            val currentFailed = replacingFailed || remote.mediaStatus?.let {
+                it.playerState == MediaStatus.PLAYER_STATE_IDLE && it.idleReason !in ENDED_IDLE_REASONS
             } == true
             val item = MediaInfoMapper.toQueueItem(media, startPositionMs = positionMs)
             // Without a position the receiver starts at its default: the beginning, or a live stream's live edge.
@@ -290,13 +302,16 @@ internal class ChromecastTarget @Inject constructor(
                 if (!autoplay) remote.pause()
             } else {
                 // A failed attempt leaves one copy of the item, not one more each time: a copy that never became
-                // current goes; once the receiver is on the copy, the old item goes if it had failed too.
+                // current goes (only this one: items queued meanwhile stay); once the receiver is on the copy, the
+                // old item goes if it had failed too.
                 val nowCurrent = currentItemId(remote)
-                val inserted = queueItemIds(remote).filter { it !in ids }
                 if (nowCurrent != null && nowCurrent != currentId) {
                     if (currentFailed) remote.queueRemoveItem(currentId, null)
-                } else if (inserted.isNotEmpty()) {
-                    remote.queueRemoveItems(inserted.toIntArray(), null)
+                } else {
+                    val copies = queueItemIds(remote).filter { id ->
+                        id !in ids && queuedContentUrl(remote, id) == media.contentUrl
+                    }
+                    if (copies.isNotEmpty()) remote.queueRemoveItems(copies.toIntArray(), null)
                 }
             }
             result
@@ -538,6 +553,14 @@ internal class ChromecastTarget @Inject constructor(
     private fun hasMedia(remote: RemoteMediaClient): Boolean =
         remote.mediaInfo != null || remote.mediaStatus?.mediaInfo != null
 
+    /** The content URL of queue item [itemId] as the receiver last described it, or null when unknown. */
+    private fun queuedContentUrl(remote: RemoteMediaClient, itemId: Int): String? {
+        val info = remote.mediaStatus?.getQueueItemById(itemId)?.media
+            ?: remote.mediaQueue.indexOfItemWithId(itemId).takeIf { it >= 0 }
+                ?.let { remote.mediaQueue.getItemAtIndex(it, false)?.media }
+        return info?.contentUrl?.takeIf { it.isNotBlank() } ?: info?.contentId
+    }
+
     // endregion
 
     private fun onMain(block: () -> Unit) {
@@ -563,6 +586,13 @@ internal class ChromecastTarget @Inject constructor(
 
         const val SUSPEND_SERVICE_DISCONNECTED = 1
         const val SUSPEND_NETWORK_LOST = 2
+
+        /** Idle reasons of media someone ended, as opposed to one that failed or never started. */
+        val ENDED_IDLE_REASONS = setOf(
+            MediaStatus.IDLE_REASON_FINISHED,
+            MediaStatus.IDLE_REASON_CANCELED,
+            MediaStatus.IDLE_REASON_INTERRUPTED,
+        )
 
         fun playerState(state: Int): RemotePlayerState = when (state) {
             MediaStatus.PLAYER_STATE_PLAYING -> RemotePlayerState.PLAYING

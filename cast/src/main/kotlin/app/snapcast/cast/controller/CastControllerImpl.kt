@@ -172,6 +172,9 @@ internal class CastControllerImpl @Inject constructor(
     /** LOADs being sent (casts, subtitle reloads, recoveries): receiver errors meanwhile are about the old media. */
     private var loadsInFlight = 0
     private var suppressReceiverErrorsUntil = 0L
+
+    /** A load failed without a connected session: errors are suppressed again for a moment when it comes back. */
+    private var suppressOnReconnect = false
     private var proxiedItem: ProxiedItem? = null
     private val recovery = ReceiverRecovery(SystemClock::elapsedRealtime)
     private var recovering = false
@@ -297,12 +300,16 @@ internal class CastControllerImpl @Inject constructor(
         loadsInFlight++
         proxyManager.acquire()
         var failed = true
+        var loadSent = false
         try {
             val media = buildRemote(video, variant, subtitle = null, direct = false)
             remember(video)
             // The service keeps the proxy alive for the new item: it may have stopped itself after the previous
             // item ended, and appendToQueue / insertNext load the item when the receiver holds no media.
             startPlaybackService()
+            // Only a receiver with no media gets a LOAD (whose failure has a status of its own); otherwise the item
+            // is queued and the current item's status is not this request's.
+            loadSent = !chromecast.holdsMedia
             val result = if (playNext) chromecast.insertNext(media) else chromecast.appendToQueue(listOf(media))
             if (result.isFailure) {
                 Log.w(TAG, "Queueing failed", result.exceptionOrNull())
@@ -321,7 +328,7 @@ internal class CastControllerImpl @Inject constructor(
         } finally {
             loadsInFlight--
             proxyManager.release()
-            afterOwnLoad(failed)
+            afterOwnLoad(failedLoad = failed && loadSent)
         }
     }
 
@@ -353,6 +360,7 @@ internal class CastControllerImpl @Inject constructor(
         loadsInFlight++
         proxyManager.acquire()
         var failed = true
+        var loadSent = false
         try {
             val fileName = withContext(Dispatchers.IO) { localMedia.displayName(uri) }
             val vtt = withContext(Dispatchers.IO) { readSubtitleAsVtt(uri, SubtitleFormat.UNKNOWN, fileName) }
@@ -367,6 +375,7 @@ internal class CastControllerImpl @Inject constructor(
             )
             val media = current.copy(textTracks = current.textTracks + track, activeTextTrackId = trackId)
             val positionMs = chromecast.playback.value?.positionMs ?: state.positionMs
+            loadSent = true
             val result = chromecast.replaceCurrent(
                 media,
                 positionMs,
@@ -389,16 +398,17 @@ internal class CastControllerImpl @Inject constructor(
         } finally {
             loadsInFlight--
             proxyManager.release()
-            afterOwnLoad(failed)
+            afterOwnLoad(failedLoad = failed && loadSent)
         }
     }
 
     /**
-     * After a load other than a cast (a subtitle reload, a queue append): a failure's status is not reported
-     * besides the error its caller gets, and an error the load kept from being looked at is looked at now.
+     * After a request other than a cast (a subtitle reload, a queue append): the status of a LOAD it sent that
+     * failed is not reported besides the error its caller gets; otherwise (it succeeded, failed before sending
+     * anything, or only queued) the receiver's status, which it kept from being looked at, is looked at now.
      */
-    private fun afterOwnLoad(failed: Boolean) {
-        if (failed) noteFailedLoad() else onReceiverError(chromecast.playback.value)
+    private fun afterOwnLoad(failedLoad: Boolean) {
+        if (failedLoad) noteFailedLoad() else onReceiverError(chromecast.playback.value)
     }
 
     override suspend fun savedPositionMs(originalUrl: String): Long? = try {
@@ -540,6 +550,7 @@ internal class CastControllerImpl @Inject constructor(
             lastReceiverErrorKey = null
             // Errors from now on belong to this media, not to a load that failed before it.
             suppressReceiverErrorsUntil = 0L
+            suppressOnReconnect = false
             _events.tryEmit(CastEvent.Started(first.title))
             val rendition = (request as? CastRequest.Remote)?.subtitle?.takeIf { it.isHlsRendition }
             if (rendition != null) selectInBandSubtitle(rendition, first)
@@ -789,6 +800,10 @@ internal class CastControllerImpl @Inject constructor(
                         pendingExpiry?.cancel()
                         scope.launch(Dispatchers.Main.immediate) { runPendingRequest(request) }
                     }
+                    if (suppressOnReconnect) {
+                        suppressOnReconnect = false
+                        suppressReceiverErrorsUntil = SystemClock.elapsedRealtime() + RECEIVER_ERROR_SUPPRESS_MS
+                    }
                     // A session that comes back usually brings an unchanged status, which is not emitted again:
                     // a failure seen (or missed) while it was away is looked at now.
                     onReceiverError(chromecast.playback.value)
@@ -799,6 +814,7 @@ internal class CastControllerImpl @Inject constructor(
                 CastConnectionState.UNAVAILABLE,
                 -> if (wasConnected) {
                     wasConnected = false
+                    suppressOnReconnect = false
                     serviceRequested = false
                     lastProgress?.let(::persist)
                     lastProgress = null
@@ -923,7 +939,7 @@ internal class CastControllerImpl @Inject constructor(
         recovering = true
         scope.launch(Dispatchers.Main.immediate) {
             val outcome = try {
-                recovery.recover(recoveryHost(item, streamIds), current.currentItemId, problem)
+                recovery.recover(recoveryHost(item, streamIds), current.currentItemId, item.contentUrl, problem)
             } finally {
                 recovering = false
             }
@@ -946,6 +962,8 @@ internal class CastControllerImpl @Inject constructor(
     /** A load whose error its caller gets: its failed status, before or after the reply, is not reported too. */
     private fun noteFailedLoad() {
         suppressReceiverErrorsUntil = SystemClock.elapsedRealtime() + RECEIVER_ERROR_SUPPRESS_MS
+        // Without a connected session its status can only come once the session is back.
+        suppressOnReconnect = chromecast.connectionState.value != CastConnectionState.CONNECTED
         chromecast.playback.value
             ?.takeIf { it.idleReason == IDLE_REASON_ERROR }
             ?.let { lastReceiverErrorKey = errorKey(it) }
@@ -959,6 +977,7 @@ internal class CastControllerImpl @Inject constructor(
     private fun recoveryHost(item: ProxiedItem, streamIds: List<String>) = object : ReceiverRecovery.Host {
         override val connectionState get() = chromecast.connectionState
         override val playback get() = chromecast.playback.value
+        override val session get() = chromecast.sessionToken
         override val loadGeneration get() = this@CastControllerImpl.loadGeneration
         override val loadsInFlight get() = this@CastControllerImpl.loadsInFlight
 
@@ -981,7 +1000,12 @@ internal class CastControllerImpl @Inject constructor(
             // A live stream starts again at its live edge.
             val positionMs = if (item.isLive) 0L else item.positionMs
             Log.i(TAG, "The receiver failed on a proxied stream; loading it again at $positionMs ms")
-            val result = chromecast.replaceCurrent(media, positionMs, autoplay = !item.paused)
+            val result = chromecast.replaceCurrent(
+                media,
+                positionMs,
+                autoplay = !item.paused,
+                replacingFailed = true,
+            )
             if (result.isFailure) Log.w(TAG, "Loading the stream again failed", result.exceptionOrNull())
             return result.isSuccess
         } catch (e: CancellationException) {

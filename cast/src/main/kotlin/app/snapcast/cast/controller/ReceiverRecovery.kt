@@ -22,6 +22,9 @@ internal class ReceiverRecovery(private val clock: () -> Long) {
         val connectionState: StateFlow<CastConnectionState>
         val playback: RemotePlaybackState?
 
+        /** Identifies the Cast session: kept through a suspension, new when a session ends or another starts. */
+        val session: Any?
+
         /** Changes with every load sent: casts, queue appends, subtitle reloads, and [reload]. */
         val loadGeneration: Int
         val loadsInFlight: Int
@@ -64,13 +67,20 @@ internal class ReceiverRecovery(private val clock: () -> Long) {
     }
 
     /**
-     * Reloads the item that failed as queue item [failedItemId] until the receiver takes it or the reloads run
-     * out. Waits through a suspended session; stops as soon as something else replaced the item.
+     * Reloads the stream [failedContentUrl] that failed as queue item [failedItemId] until the receiver takes it
+     * or the reloads run out. Waits through a suspended session; stops as soon as something else replaced the
+     * item, or the session is another one.
      */
-    suspend fun recover(host: Host, failedItemId: Int?, firstProblem: StreamProblem?): Outcome {
+    suspend fun recover(
+        host: Host,
+        failedItemId: Int?,
+        failedContentUrl: String,
+        firstProblem: StreamProblem?,
+    ): Outcome {
         var problem = firstProblem
         var generation = host.loadGeneration
         var reloadFailed = false
+        val session = host.session
         while (true) {
             val used = reloadsInWindow()
             if (used >= DELAYS_MS.size) return Outcome.Failed(problem)
@@ -82,12 +92,17 @@ internal class ReceiverRecovery(private val clock: () -> Long) {
                 // The resumed session publishes the receiver's current status.
                 delay(SETTLE_MS)
             }
+            // Stopped and cast again, or moved to another device: not the receiver that failed.
+            if (host.session !== session) {
+                return if (host.loadGeneration == generation) Outcome.Lost else Outcome.Replaced
+            }
             if (host.loadGeneration != generation || host.loadsInFlight > 0) return Outcome.Replaced
-            if (!stillFailed(host.playback, reloadFailed, failedItemId)) return Outcome.Replaced
+            if (!stillFailed(host.playback, reloadFailed, failedItemId, failedContentUrl)) return Outcome.Replaced
             reloads.addLast(clock())
             val reloaded = host.reload() ?: return Outcome.Failed(problem)
             if (host.loadGeneration != generation + 1) return Outcome.Replaced
             if (reloaded) return Outcome.Recovered
+            if (host.session !== session) return Outcome.Lost
             // The outage goes on, or the link has died meanwhile.
             generation = host.loadGeneration
             reloadFailed = true
@@ -97,12 +112,21 @@ internal class ReceiverRecovery(private val clock: () -> Long) {
     }
 
     /**
-     * Before a reload: the failed item, still failed. After a failed reload: the item it left (a failed load may
-     * leave no idle reason, or no status at all), not one stopped, finished or replaced since.
+     * Before a reload: the failed item, still failed. After a failed reload: the copy of the stream it left (a
+     * failed load may leave no idle reason, no media, or no status at all), not one stopped, finished or replaced
+     * since, nor another item the receiver moved on to.
      */
-    private fun stillFailed(state: RemotePlaybackState?, reloadFailed: Boolean, failedItemId: Int?): Boolean =
+    private fun stillFailed(
+        state: RemotePlaybackState?,
+        reloadFailed: Boolean,
+        failedItemId: Int?,
+        failedContentUrl: String,
+    ): Boolean =
         if (reloadFailed) {
-            state == null || (state.playerState == RemotePlayerState.IDLE && state.idleReason !in ENDED_REASONS)
+            state == null || (
+                state.playerState == RemotePlayerState.IDLE && state.idleReason !in ENDED_REASONS &&
+                    (state.contentUrl == null || state.contentUrl == failedContentUrl)
+                )
         } else {
             state != null && state.idleReason == ReceiverQueue.IDLE_REASON_ERROR && state.currentItemId == failedItemId
         }
@@ -122,7 +146,7 @@ internal class ReceiverRecovery(private val clock: () -> Long) {
         problem != null && problem.kind != StreamProblem.Kind.UNREACHABLE
 
     companion object {
-        /** The wait before each reload within [WINDOW_MS]: a short blip is over by the first, a longer one by the last. */
+        /** The wait before each reload within [WINDOW_MS]: a short blip is over by the first, a long one by the last. */
         val DELAYS_MS = longArrayOf(2_000L, 5_000L, 15_000L)
         const val WINDOW_MS = 10 * 60_000L
         const val RECENT_USE_MS = 2 * 60_000L
