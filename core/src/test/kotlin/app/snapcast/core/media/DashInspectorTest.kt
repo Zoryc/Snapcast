@@ -283,6 +283,14 @@ class DashInspectorTest {
     }
 
     @Test
+    fun `a manifest nested too deeply is refused instead of overflowing the stack`() {
+        fun nested(levels: Int) = staticMpd.replace("</MPD>", "<a>".repeat(levels) + "</a>".repeat(levels) + "</MPD>")
+        assertThat(DashInspector.inspect(nested(20), manifestUrl)).isNotNull()
+        assertThat(DashInspector.inspect(nested(80), manifestUrl)).isNull()
+        assertThat(DashInspector.inspect(nested(100_000), manifestUrl)).isNull()
+    }
+
+    @Test
     fun `parseIsoDuration handles common forms`() {
         assertThat(DashInspector.parseIsoDuration("PT1H2M3.5S")).isEqualTo(3723.5)
         assertThat(DashInspector.parseIsoDuration("P1DT2H")).isEqualTo(93_600.0)

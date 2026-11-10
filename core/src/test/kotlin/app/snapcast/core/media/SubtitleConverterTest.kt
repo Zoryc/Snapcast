@@ -157,4 +157,13 @@ class SubtitleConverterTest {
     fun `invalid TTML yields an empty VTT document`() {
         assertThat(SubtitleConverter.toVtt("<tt><p>broken", SubtitleFormat.TTML)).isEqualTo("WEBVTT\n")
     }
+
+    @Test
+    fun `TTML nested too deeply yields an empty VTT document instead of overflowing the stack`() {
+        fun nested(levels: Int) = "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body>" + "<div>".repeat(levels) +
+            "<p begin=\"1s\" end=\"2s\">Deep</p>" + "</div>".repeat(levels) + "</body></tt>"
+        assertThat(SubtitleConverter.toVtt(nested(20), SubtitleFormat.TTML)).contains("Deep")
+        assertThat(SubtitleConverter.toVtt(nested(80), SubtitleFormat.TTML)).isEqualTo("WEBVTT\n")
+        assertThat(SubtitleConverter.toVtt(nested(100_000), SubtitleFormat.TTML)).isEqualTo("WEBVTT\n")
+    }
 }

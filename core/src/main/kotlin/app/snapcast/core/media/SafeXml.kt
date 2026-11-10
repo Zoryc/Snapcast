@@ -16,19 +16,51 @@ import javax.xml.parsers.DocumentBuilderFactory
  * need a DTD, so documents declaring one are rejected outright; the factory is additionally configured
  * to refuse DTDs and external entities. Each setting is applied on its own because Android's parser
  * does not support all of them.
+ *
+ * Documents nested deeper than [MAX_DEPTH] are refused as well: Android's parser and the code that walks
+ * the tree recurse once per level, so a page could otherwise end the app with a stack overflow.
  */
-internal object SafeXml {
+object SafeXml {
     private val DTD_MARKER = Regex("<!DOCTYPE|<!ENTITY", RegexOption.IGNORE_CASE)
 
-    /** Parses [xml] into a namespace-aware DOM, or returns null when it is malformed or declares a DTD. */
+    /** Real manifests and subtitle files stay under a dozen levels. */
+    private const val MAX_DEPTH = 64
+
+    /**
+     * Parses [xml] into a namespace-aware DOM, or returns null when it is malformed, declares a DTD or is
+     * nested too deeply.
+     */
     fun parse(xml: String): Document? {
         val text = xml.removePrefix("﻿")
         if (text.isBlank() || DTD_MARKER.containsMatchIn(text)) return null
         return try {
-            newDocumentBuilder().parse(InputSource(StringReader(text)))
+            newDocumentBuilder().parse(InputSource(StringReader(text))).takeIf(::isShallow)
         } catch (e: Exception) {
             null
+        } catch (e: StackOverflowError) {
+            null
         }
+    }
+
+    /** Walks the tree without recursion. */
+    private fun isShallow(document: Document): Boolean {
+        var node: Node? = document.documentElement
+        var depth = 1
+        while (node != null) {
+            if (depth > MAX_DEPTH) return false
+            val child = node.firstChild
+            if (child != null) {
+                node = child
+                depth++
+            } else {
+                while (node != null && node.nextSibling == null) {
+                    node = node.parentNode
+                    depth--
+                }
+                node = node?.nextSibling
+            }
+        }
+        return true
     }
 
     /**

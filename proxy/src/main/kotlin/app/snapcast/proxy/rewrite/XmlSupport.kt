@@ -1,39 +1,18 @@
 package app.snapcast.proxy.rewrite
 
+import app.snapcast.core.media.SafeXml as CoreSafeXml
 import org.w3c.dom.Attr
 import org.w3c.dom.Document
 import org.w3c.dom.Element
 import org.w3c.dom.Node
-import org.xml.sax.ErrorHandler
-import org.xml.sax.InputSource
-import org.xml.sax.SAXParseException
-import java.io.StringReader
 import java.nio.charset.Charset
-import javax.xml.XMLConstants
-import javax.xml.parsers.DocumentBuilderFactory
 
-/**
- * DOM parsing hardened against XXE and entity expansion: manifests never need a DTD, so documents declaring
- * one are refused, and the factory is told to refuse DTDs and external entities where the platform supports
- * it (Android's parser ignores several of these settings, hence the textual pre-check).
- */
+/** XML parsing (core's hardened parser) and decoding for manifests. */
 internal object SafeXml {
-    private val DTD_MARKER = Regex("<!DOCTYPE|<!ENTITY", RegexOption.IGNORE_CASE)
     private val XML_DECLARED_ENCODING = Regex("^<\\?xml[^>]*?encoding\\s*=\\s*[\"']([A-Za-z0-9._\\-]+)[\"']")
 
-    /** Namespace-aware DOM of [xml], or null when it is malformed or declares a DTD. */
-    fun parse(xml: String): Document? {
-        val text = xml.removePrefix("\uFEFF")
-        if (text.isBlank() || DTD_MARKER.containsMatchIn(text)) return null
-        return try {
-            val builder = factory().newDocumentBuilder()
-            builder.setEntityResolver { _, _ -> InputSource(StringReader("")) }
-            builder.setErrorHandler(ThrowingErrorHandler)
-            builder.parse(InputSource(StringReader(text)))
-        } catch (e: Exception) {
-            null
-        }
-    }
+    /** Namespace-aware DOM of [xml], or null when core's parser refuses it (malformed, a DTD, nested too deeply). */
+    fun parse(xml: String): Document? = CoreSafeXml.parse(xml)
 
     /**
      * Decodes an XML document: a byte order mark wins, then the encoding of the XML declaration, then the
@@ -57,37 +36,6 @@ internal object SafeXml {
         Charset.forName(name)
     } catch (e: IllegalArgumentException) {
         null
-    }
-
-    private fun factory(): DocumentBuilderFactory {
-        val factory = DocumentBuilderFactory.newInstance()
-        factory.isNamespaceAware = true
-        attempt { factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true) }
-        attempt { factory.setFeature("http://xml.org/sax/features/external-general-entities", false) }
-        attempt { factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false) }
-        attempt { factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false) }
-        attempt { factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true) }
-        attempt { factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "") }
-        attempt { factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "") }
-        attempt { factory.isXIncludeAware = false }
-        attempt { factory.isValidating = false }
-        return factory
-    }
-
-    private inline fun attempt(block: () -> Unit) {
-        try {
-            block()
-        } catch (e: Exception) {
-            // Unsupported by this platform's parser; the DTD pre-check still applies.
-        } catch (e: AbstractMethodError) {
-            // Older parser implementations do not implement every JAXP setter.
-        }
-    }
-
-    private object ThrowingErrorHandler : ErrorHandler {
-        override fun warning(exception: SAXParseException) = Unit
-        override fun error(exception: SAXParseException) = throw exception
-        override fun fatalError(exception: SAXParseException) = throw exception
     }
 }
 

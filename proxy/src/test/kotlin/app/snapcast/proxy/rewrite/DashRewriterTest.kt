@@ -314,6 +314,14 @@ class DashRewriterTest {
     }
 
     @Test
+    fun `a manifest nested too deeply is refused instead of overflowing the stack`() {
+        fun nested(levels: Int) = "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">" + "<a>".repeat(levels) + "</a>".repeat(levels) + "</MPD>"
+        assertThat(DashRewriter.rewrite(nested(20), manifestUrl, mapper)).isNotNull()
+        assertThat(DashRewriter.rewrite(nested(80), manifestUrl, mapper)).isNull()
+        assertThat(DashRewriter.rewrite(nested(100_000), manifestUrl, mapper)).isNull()
+    }
+
+    @Test
     fun `xml decoding honours the declared encoding`() {
         val bytes = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><MPD><Label>Café</Label></MPD>".toByteArray(Charsets.ISO_8859_1)
         assertThat(SafeXml.decode(bytes, null)).contains("Café")
