@@ -16,3 +16,6 @@ captures/
 # Signing
 *.jks
 *.keystore
+
+# Python
+__pycache__/
