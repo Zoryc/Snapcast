@@ -18,13 +18,13 @@ internal class ProxyRoutes(private val signer: UrlSigner) {
     /** `/u/{id}/{sig}/{b64url}/{name}`: serves exactly [absoluteUrl]; the name only helps receivers guess the type. */
     fun exact(id: String, absoluteUrl: String): String {
         val encoded = Base64Url.encode(absoluteUrl)
-        return "/$EXACT/$id/${signer.sign(id, encoded)}/$encoded/${fileHint(absoluteUrl)}"
+        return "/$EXACT/$id/${signer.sign(EXACT, id, encoded)}/$encoded/${fileHint(absoluteUrl)}"
     }
 
     /** `/b/{id}/{sig}/{b64base}/`: references appended to it are resolved against [baseDir]. */
     fun base(id: String, baseDir: String): String {
         val encoded = Base64Url.encode(baseDir)
-        return "/$BASE/$id/${signer.sign(id, encoded)}/$encoded/"
+        return "/$BASE/$id/${signer.sign(BASE, id, encoded)}/$encoded/"
     }
 
     fun mapperFor(id: String): ProxyUrlMapper = object : ProxyUrlMapper {

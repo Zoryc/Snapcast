@@ -98,6 +98,19 @@ class StreamProxyRoutesTest {
     }
 
     @Test
+    fun `a signature is bound to its route`() {
+        val stream = registerHls()
+        origin.text("/hls/account.json", "secret", "application/json")
+        // The signature of one exact URL, replayed as a base, would fetch any file next to it with the user's cookies.
+        val exact = variantPath(stream).split('/')
+        assertThat(harness.fetch("/b/${exact[2]}/${exact[3]}/${exact[4]}/account.json").code).isEqualTo(403)
+        assertThat(origin.requests.none { it.url.encodedPath == "/hls/account.json" }).isTrue()
+
+        val base = signedBasePath("http://origin.test:${origin.port}/dash/").split('/')
+        assertThat(harness.fetch("/u/${base[2]}/${base[3]}/${base[4]}/x").code).isEqualTo(403)
+    }
+
+    @Test
     fun `base routes cannot leave the signed origin`() {
         val signed = signedBasePath("http://origin.test:${origin.port}/dash/")
         origin.text("/dash/seg-1.m4s", "segment", "video/iso.segment")

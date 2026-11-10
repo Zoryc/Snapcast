@@ -114,7 +114,7 @@ internal class ProxyHandler(
         val stream = registry.stream(id) ?: return Responses.notFound()
         val signature = segments.getOrNull(2)
         val encoded = segments.getOrNull(3)
-        if (encoded.isNullOrEmpty() || !signer.verify(id, encoded, signature)) return Responses.forbidden()
+        if (encoded.isNullOrEmpty() || !signer.verify(ProxyRoutes.EXACT, id, encoded, signature)) return Responses.forbidden()
         val url = Base64Url.decodeToString(encoded)?.takeIf(UrlUtils::isHttp) ?: return Responses.error(400, "Bad Request")
         return proxyRemote(Target(id, stream, url, main = false), request)
     }
@@ -126,7 +126,7 @@ internal class ProxyHandler(
         val stream = registry.stream(id) ?: return Responses.notFound()
         val signature = parts.getOrNull(3)
         val encoded = parts.getOrNull(4)
-        if (encoded.isNullOrEmpty() || !signer.verify(id, encoded, signature)) return Responses.forbidden()
+        if (encoded.isNullOrEmpty() || !signer.verify(ProxyRoutes.BASE, id, encoded, signature)) return Responses.forbidden()
         val base = Base64Url.decodeToString(encoded)?.takeIf(UrlUtils::isHttp) ?: return Responses.error(400, "Bad Request")
         val target = resolveUnder(base, parts.getOrElse(5) { "" }, request.rawQuery) ?: return Responses.forbidden()
         return proxyRemote(Target(id, stream, target, main = false), request)
