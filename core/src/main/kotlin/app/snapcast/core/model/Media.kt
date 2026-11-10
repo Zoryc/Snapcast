@@ -2,6 +2,7 @@ package app.snapcast.core.model
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
+import java.util.Locale
 
 /** Container / delivery format of a detected stream. */
 @Serializable
@@ -92,7 +93,7 @@ data class VideoVariant(
 
     companion object {
         fun formatBitrate(bps: Long): String = when {
-            bps >= 1_000_000 -> "%.1f Mbps".format(bps / 1_000_000.0)
+            bps >= 1_000_000 -> String.format(Locale.US, "%.1f Mbps", bps / 1_000_000.0)
             else -> "${bps / 1000} kbps"
         }
     }

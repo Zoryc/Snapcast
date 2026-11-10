@@ -2,6 +2,7 @@ package app.snapcast.core.model
 
 import com.google.common.truth.Truth.assertThat
 import org.junit.Test
+import java.util.Locale
 
 class QualityLabelTest {
     private fun video(type: StreamType, variants: List<VideoVariant> = emptyList(), width: Int? = null, height: Int? = null) =
@@ -69,6 +70,17 @@ class QualityLabelTest {
         val master = video(StreamType.HLS, variants = listOf(variant(null, null, 800_000), variant(null, null, 5_000_000)), height = 360)
         assertThat(master.qualityLabel).isEqualTo("5.0 Mbps")
         assertThat(master.hasQualityRange).isTrue()
+    }
+
+    @Test
+    fun `bitrate label ignores the default locale`() {
+        val previous = Locale.getDefault()
+        try {
+            Locale.setDefault(Locale.GERMANY)
+            assertThat(VideoVariant.formatBitrate(2_500_000)).isEqualTo("2.5 Mbps")
+        } finally {
+            Locale.setDefault(previous)
+        }
     }
 
     @Test
