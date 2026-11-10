@@ -1,5 +1,7 @@
 package app.snapcast.data.history
 
+import android.database.SQLException
+import android.util.Log
 import app.snapcast.data.db.HistoryDao
 import app.snapcast.data.db.toModel
 import javax.inject.Inject
@@ -30,13 +32,22 @@ internal class RoomHistoryRepository @Inject constructor(
 
     override suspend fun recordVisit(url: String, title: String?) {
         if (!HistoryQueries.isRecordable(url)) return
-        dao.recordVisit(url = url, title = HistoryQueries.cleanTitle(title), visitedAt = System.currentTimeMillis())
+        bestEffort { dao.recordVisit(url = url, title = HistoryQueries.cleanTitle(title), visitedAt = System.currentTimeMillis()) }
     }
 
     override suspend fun updateTitle(url: String, title: String) {
         val clean = HistoryQueries.cleanTitle(title) ?: return
         if (!HistoryQueries.isRecordable(url)) return
-        dao.updateLatestTitle(url, clean)
+        bestEffort { dao.updateLatestTitle(url, clean) }
+    }
+
+    /** These writes happen by themselves while browsing: a full disk or a damaged database must not end the app. */
+    private inline fun bestEffort(write: () -> Unit) {
+        try {
+            write()
+        } catch (e: SQLException) {
+            Log.w(TAG, "Could not write history", e)
+        }
     }
 
     override suspend fun suggestions(text: String, limit: Int): List<HistoryEntry> {
@@ -51,5 +62,9 @@ internal class RoomHistoryRepository @Inject constructor(
 
     override suspend fun clear() {
         dao.clear()
+    }
+
+    private companion object {
+        const val TAG = "SnapcastData"
     }
 }
