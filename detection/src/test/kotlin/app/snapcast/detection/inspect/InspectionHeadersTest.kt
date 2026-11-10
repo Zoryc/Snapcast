@@ -51,6 +51,27 @@ class InspectionHeadersTest {
     }
 
     @Test
+    fun `credentials of an https video or page are not sent over plain http`() {
+        val updated = video.copy(cookiesByHost = mapOf("cdn.example" to "fresh=3"))
+        val variant = InspectionHeaders.forRequest(updated, "http://cdn.example/hls/720.m3u8")
+        assertThat(variant).doesNotContainKey("Cookie")
+        assertThat(variant).doesNotContainKey("Authorization")
+        assertThat(InspectionHeaders.forRequest(updated, "https://cdn.example/hls/720.m3u8")).containsEntry("Cookie", "fresh=3")
+
+        val httpSource = DetectedVideo(
+            id = "h",
+            tabId = "t",
+            url = "http://site.example/v.mp4",
+            type = StreamType.MP4,
+            pageUrl = "https://site.example/watch",
+            cookiesByHost = mapOf("site.example" to "s=1"),
+        )
+        assertThat(InspectionHeaders.forRequest(httpSource)).doesNotContainKey("Cookie")
+        // A page that is itself plain http sends its cookies there, as the browser does.
+        assertThat(InspectionHeaders.forRequest(httpSource.copy(pageUrl = "http://site.example/watch"))).containsEntry("Cookie", "s=1")
+    }
+
+    @Test
     fun `no headers captured means none replayed`() {
         assertThat(InspectionHeaders.forRequest(video.copy(headers = MediaHeaders.NONE, cookiesByHost = emptyMap()))).isEmpty()
     }
